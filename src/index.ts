@@ -56,47 +56,52 @@ async function handleChatRequest(request: Request, env: Env): Promise<Response> 
     const { messages = [] } = (await request.json()) as { messages: ChatMessage[] };
 
     // 如前端未带 system，则补一个
-    if (!messages.some((m) => m.role === "system")) {
-      messages.unshift({ role: "system", content: SYSTEM_PROMPT });
+    if (!messages.some(m => m.role === "system")) {
+      messages.unshift({
+        role: "system",
+        content: "You are a helpful, friendly assistant. Provide concise and accurate responses."
+      });
     }
 
-    // 调用 OpenAI Chat Completions（流式）
-    const upstream = await fetch("https://api.openai.com/v1/chat/completions", {
+    // 把 Chat 风格消息合成一个输入串（Responses API 推荐）
+    const input = messages.map(m => `${m.role.toUpperCase()}: ${m.content}`).join("\n");
+
+    // 用 Responses API，并且开启流式
+    const upstream = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
         "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        model: "gpt-5",   // 可改为 "gpt-5-mini" / "gpt-5-nano"
-        messages,         // 直接使用前端传入的对话
-        stream: true,     // 关键：开启流式
-        temperature: 0.2,
-      }),
+        model: "gpt-5",        // 可换 gpt-5-mini / gpt-5-nano
+        stream: true,
+        input
+      })
     });
 
     if (!upstream.ok || !upstream.body) {
       const text = await upstream.text().catch(() => "");
-      return new Response(
-        JSON.stringify({ error: "OpenAI upstream error", detail: text || upstream.statusText }),
-        { status: upstream.status, headers: { "content-type": "application/json" } }
-      );
+      return new Response(JSON.stringify({ error: "Upstream error", detail: text || upstream.statusText }), {
+        status: upstream.status,
+        headers: { "content-type": "application/json" }
+      });
     }
 
-    // 将 OpenAI 的 SSE 原样透传给前端（模板前端使用 EventSource/ReadableStream 解析）
+    // 原样透传 OpenAI 的 SSE 到前端
     return new Response(upstream.body, {
       headers: {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
-        "Access-Control-Allow-Origin": "*",
-      },
+        "Access-Control-Allow-Origin": "*"
+      }
     });
   } catch (err) {
     console.error("chat error:", err);
     return new Response(JSON.stringify({ error: "Failed to process request" }), {
       status: 500,
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json" }
     });
   }
 }
