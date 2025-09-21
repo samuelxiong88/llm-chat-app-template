@@ -94,91 +94,125 @@ export default {
 } satisfies ExportedHandler<Env>;
 
 async function handleChat(request: Request, env: Env): Promise<Response> {
+  const apiBase = env.OPENAI_API_BASE || "https://api.openai.com/v1";
+  const model = env.OPENAI_MODEL || "gpt-4o";
+
+  // 调试开关：/api/chat?mode=json 时走非流式，原样返回 JSON，便于看错误
+  const url = new URL(request.url);
+  const debugJson = url.searchParams.get("mode") === "json";
+
+  // 读取请求体
+  let body: any;
   try {
-    const pingResponse = await fetch(`${env.OPENAI_API_BASE || "https://api.openai.com/v1"}/models`, {
-      headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+    body = await request.json();
+  } catch (e) {
+    return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
+      status: 400, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
-    if (!pingResponse.ok) {
-      const errorDetail = await pingResponse.text();
-      console.error("API key validation failed:", errorDetail);
-      return new Response(JSON.stringify({ error: "Invalid API key", detail: errorDetail }), {
-        status: 401,
-        headers: {
-          "content-type": "application/json",
-          "Access-Control-Allow-Origin": "*",
-        },
-      });
-    }
+  }
 
-    let body;
-    try {
-      body = await request.json();
-      console.log("Received request body:", JSON.stringify(body, null, 2));
-    } catch (e) {
-      console.error("Invalid JSON body:", e);
-      return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
-        status: 400,
-        headers: {
-          "content-type": "application/json",
-          "Access-Control-Allow-Origin": "*",
-        },
-      });
-    }
-    const messages = Array.isArray(body.messages) ? body.messages : [];
-    if (!messages.length) {
-      console.warn("No messages provided in request body");
-    } else {
-      console.log("Messages:", messages.map(m => ({ role: m.role, content: m.content.slice(0, 20) + (m.content.length > 20 ? "..." : "") })));
-    }
-    if (!messages.some((m) => m.role === "system")) {
-      messages.unshift({ role: "system", content: SYSTEM_PROMPT });
-    }
-    const model = env.OPENAI_MODEL || "gpt-4o";
-    const apiBase = env.OPENAI_API_BASE || "https://api.openai.com/v1";
-    console.log("Using model:", model, "API base:", apiBase);
+  // 规范 messages，并补 system
+  const messages: ChatMessage[] = Array.isArray(body?.messages) ? body.messages : [];
+  if (!messages.some((m) => m.role === "system")) {
+    messages.unshift({ role: "system", content: SYSTEM_PROMPT });
+  }
 
-    const maxRetries = 2;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 120000); // 增加到120秒
+  // ---------- 调试：非流式路径 ----------
+  if (debugJson) {
+    const r = await fetch(`${apiBase}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model, messages, stream: false, temperature: 0.2 }),
+    });
+    const text = await r.text();
+    console.log("CHAT(JSON) status:", r.status, "body:", text.slice(0, 400));
+    return new Response(text, { status: r.status, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } });
+  }
 
-      try {
-        const upstream = await fetch(`${apiBase}/chat/completions`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            model,
-            messages,
-            stream: true,
-            temperature: 0.2,
-          }),
-          signal: controller.signal,
-        });
-        clearTimeout(timeoutId);
+  // ---------- 正式：流式路径（SSE → 模板事件） ----------
+  const upstream = await fetch(`${apiBase}/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ model, messages, stream: true, temperature: 0.2 }),
+  });
 
-        console.log("Upstream response status:", upstream.status, "headers:", Object.fromEntries(upstream.headers));
-        if (!upstream.ok || !upstream.body) {
-          const detail = await upstream.text().catch(() => "No detail available");
-          console.error("Upstream error:", { status: upstream.status, detail });
-          if (attempt < maxRetries) {
-            console.log(`Retrying (${attempt + 1}/${maxRetries})...`);
-            await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
-            continue;
+  if (!upstream.ok || !upstream.body) {
+    const detail = await upstream.text().catch(() => "");
+    console.log("OpenAI upstream error:", upstream.status, detail.slice(0, 400));
+    return new Response(JSON.stringify({ error: "OpenAI upstream error", status: upstream.status, detail }),
+      { status: upstream.status, headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" } });
+  }
+
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const reader = upstream.body.getReader();
+  let buffer = "";
+
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const { value, done } = await reader.read();
+      if (done) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true })}\n\n`));
+        controller.close();
+        return;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // 兼容 \r\n 和 \n\n 作为事件边界
+      let sepIndex: number;
+      while ((sepIndex = buffer.indexOf("\n\n")) !== -1 || (sepIndex = buffer.indexOf("\r\n\r\n")) !== -1) {
+        const sepLen = buffer.startsWith("\r\n", sepIndex - 1) ? 4 : 2;
+        const rawEvent = buffer.slice(0, sepIndex);
+        buffer = buffer.slice(sepIndex + sepLen);
+
+        // 逐行解析 data:
+        const lines = rawEvent.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+
+          if (payload === "[DONE]") {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true })}\n\n`));
+            controller.close();
+            return;
           }
-          return new Response(
-            JSON.stringify({ error: "OpenAI upstream error", status: upstream.status, detail }),
-            {
-              status: upstream.status,
-              headers: {
-                "content-type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-              },
-            }
-          );
+
+          // 有些模型/中间层会发心跳/非 JSON 行，直接忽略
+          let json: any;
+          try { json = JSON.parse(payload); } catch { continue; }
+
+          const delta = json?.choices?.[0]?.delta;
+          const content = typeof delta?.content === "string" ? delta.content : "";
+
+          // 过滤空/纯空白增量，避免前端出现“空白回复”
+          if (content.trim().length === 0) continue;
+
+          // 按模板协议发出：{"response":"<增量>","done":false}
+          controller.enqueue(encoder.encode(
+            `data: ${JSON.stringify({ response: content, done: false })}\n\n`
+          ));
         }
+      }
+    },
+    cancel() { try { reader.cancel(); } catch {} },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "Access-Control-Allow-Origin": "*",
+    },
+  });
+}
 
         const encoder = new TextEncoder();
         const decoder = new TextDecoder();
