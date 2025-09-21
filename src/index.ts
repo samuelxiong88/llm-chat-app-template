@@ -187,7 +187,13 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
 
     const stream = new ReadableStream<Uint8Array>({
       async pull(controller) {
-        const { value, done } = await reader.read();
+        // ✅ 就在这里，一开始先发一条 debug 事件
+    controller.enqueue(
+      encoder.encode(`data: ${JSON.stringify({ debug: "stream started" })}\n\n`)
+    );
+
+    const { value, done } = await reader.read();
+    // ... 后面的解析逻辑 ...
 
         if (done) {
           // 冲洗尾块：buffer 里可能残留一个未以空行结尾的事件
