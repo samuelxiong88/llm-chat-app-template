@@ -115,25 +115,33 @@ export default {
 } satisfies ExportedHandler<Env>;
 
 async function handleChat(request: Request, env: Env): Promise<Response> {
-  try {
-    const apiBase = env.OPENAI_API_BASE || DEFAULT_API_BASE;
-    const model = env.OPENAI_MODEL || "gpt-4o";
+  const apiBase = "https://api.openai.com/v1";
+  const model   = env.OPENAI_MODEL || "gpt-4o";
+  const body    = await request.json();
 
-    // 调试开关：/api/chat?mode=json → 非流式 JSON
-    const url = new URL(request.url);
-    const debugJson = url.searchParams.get("mode") === "json";
+  const upstream = await fetch(`${apiBase}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      messages: body.messages || [],
+      stream: true
+    }),
+  });
 
-    // 读取并规范 messages
-    let body: any;
-    try {
-      body = await request.json();
-    } catch {
-      return jsonResponse({ error: "Invalid JSON body" }, 400);
-    }
-    const messages: ChatMessage[] = Array.isArray(body?.messages) ? body.messages : [];
-    if (!messages.some((m) => m.role === "system")) {
-      messages.unshift({ role: "system", content: SYSTEM_PROMPT });
-    }
+  // 🔑 直接把 OpenAI 的流返回给前端，不做二次解析
+  return new Response(upstream.body, {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "Access-Control-Allow-Origin": "*",
+    },
+  });
+}
 
     // 组装 payload（gpt-5* 不发 temperature）
     const payload: any = { model, messages, stream: !debugJson };
