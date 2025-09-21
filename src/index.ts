@@ -1,11 +1,8 @@
 /**
- * LLM Chat App on Cloudflare Workers — OpenAI backend (final, single impl)
+ * LLM Chat App on Cloudflare Workers — OpenAI backend (final unified)
  * - /api/debug  查看环境变量
  * - /api/ping   GET /v1/models 验证 KEY/网络
- * - /api/chat   /v1/chat/completions（支持 POST 正式 + GET 调试 ?q=）
- *   将 OpenAI 的 SSE 解析并转为前端协议：
- *     data: {"response":"<累计全文>","done":false}\n\n
- *     data: {"done":true}\n\n
+ * - /api/chat   GET → 直通 OpenAI SSE；POST → 解析为 {response,done}
  */
 
 import type { Env, ChatMessage } from "./types";
@@ -14,7 +11,7 @@ const SYSTEM_PROMPT =
   "You are a helpful, friendly assistant. Provide concise and accurate responses.";
 const DEFAULT_API_BASE = "https://api.openai.com/v1";
 
-// GPT-5 / realtime / audio 系列不接受自定义 temperature
+// GPT-5 / realtime / audio 不接受自定义 temperature
 function modelSupportsTemperature(model: string): boolean {
   const m = (model || "").toLowerCase();
   return !(m.startsWith("gpt-5") || m.includes("realtime") || m.includes("audio"));
@@ -33,7 +30,7 @@ export default {
       const url = new URL(request.url);
       const apiBase = env.OPENAI_API_BASE || DEFAULT_API_BASE;
 
-      // ===== 静态资源（前端）— 兜底，避免 ASSETS 未绑定抛 1101 =====
+      // ===== 静态资源（前端）兜底 =====
       if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
         try {
           if (env.ASSETS && typeof (env.ASSETS as any).fetch === "function") {
@@ -62,7 +59,7 @@ export default {
         });
       }
 
-      // ===== /api/debug：查看变量是否读到 =====
+      // ===== /api/debug =====
       if (url.pathname === "/api/debug") {
         return jsonResponse({
           OPENAI_API_KEY: env.OPENAI_API_KEY ? "set" : "not set",
@@ -71,7 +68,7 @@ export default {
         });
       }
 
-      // ===== /api/ping：验证 KEY/网络 =====
+      // ===== /api/ping =====
       if (url.pathname === "/api/ping") {
         try {
           const r = await fetch(`${apiBase}/models`, {
@@ -87,27 +84,57 @@ export default {
         }
       }
 
-      // ===== /api/chat：支持 POST（正式）与 GET（调试 ?q=）=====
+      // ===== /api/chat =====
       if (url.pathname === "/api/chat") {
+        // GET: 直通 OpenAI SSE
         if (request.method === "GET") {
-          // 仅调试：GET /api/chat?q=Hello
-          const q = url.searchParams.get("q") || "";
-          const fake = new Request(request.url, {
+          const q = url.searchParams.get("q") || "Hello";
+          const model = env.OPENAI_MODEL || "gpt-4o";
+          const supportsTemp = modelSupportsTemperature(model);
+          const payload: any = {
+            model,
+            stream: true,
+            messages: [
+              { role: "system", content: SYSTEM_PROMPT },
+              { role: "user", content: q },
+            ],
+          };
+          if (supportsTemp) payload.temperature = 0.2;
+
+          const upstream = await fetch(`${apiBase}/chat/completions`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              messages: q ? [{ role: "user", content: q }] : [],
-            }),
+            headers: {
+              "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(payload),
           });
-          return handleChat(fake, env);
+
+          if (!upstream.ok || !upstream.body) {
+            const detail = await upstream.text().catch(() => "");
+            return jsonResponse(
+              { error: "OpenAI upstream error (GET passthrough)", status: upstream.status, detail },
+              upstream.status
+            );
+          }
+
+          return new Response(upstream.body, {
+            headers: {
+              "Content-Type": "text/event-stream; charset=utf-8",
+              "Cache-Control": "no-cache",
+              "Connection": "keep-alive",
+              "Access-Control-Allow-Origin": "*",
+            },
+          });
         }
+
+        // POST: 解析累积输出
         if (request.method !== "POST") return jsonResponse({ error: "Method not allowed" }, 405);
         return handleChat(request, env);
       }
 
       return jsonResponse({ error: "Not found" }, 404);
     } catch (e) {
-      // 顶层兜底，避免 1101 HTML
       return jsonResponse({ error: "Worker exception", detail: String(e) }, 500);
     }
   },
@@ -118,11 +145,9 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
     const apiBase = env.OPENAI_API_BASE || DEFAULT_API_BASE;
     const model = env.OPENAI_MODEL || "gpt-4o";
 
-    // 调试开关：/api/chat?mode=json → 非流式 JSON
     const url = new URL(request.url);
     const debugJson = url.searchParams.get("mode") === "json";
 
-    // 读取并规范 messages
     let body: any;
     try {
       body = await request.json();
@@ -134,11 +159,9 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
       messages.unshift({ role: "system", content: SYSTEM_PROMPT });
     }
 
-    // 组装 payload（gpt-5* 不发 temperature）
     const payload: any = { model, messages, stream: !debugJson };
     if (modelSupportsTemperature(model)) payload.temperature = 0.2;
 
-    // 非流式（调试）
     if (debugJson) {
       const r = await fetch(`${apiBase}/chat/completions`, {
         method: "POST",
@@ -155,20 +178,14 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
       });
     }
 
-    // ===== 流式：解析 OpenAI SSE → 前端协议（累计推送 + 必发 done:true + 冲洗尾块）=====
-    let upstream: Response;
-    try {
-      upstream = await fetch(`${apiBase}/chat/completions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      });
-    } catch (e) {
-      return jsonResponse({ error: "OpenAI fetch failed", detail: String(e) }, 500);
-    }
+    const upstream = await fetch(`${apiBase}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
 
     if (!upstream.ok || !upstream.body) {
       const detail = await upstream.text().catch(() => "");
@@ -180,15 +197,14 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
     const reader = upstream.body.getReader();
 
     let buffer = "";
-    let acc = "";        // 累计到当前完整文本
-    let sentAny = false; // 首块去前导空格
+    let acc = "";
+    let sentAny = false;
 
     const stream = new ReadableStream<Uint8Array>({
       async pull(controller) {
         const { value, done } = await reader.read();
 
         if (done) {
-          // 冲洗尾块：buffer 里可能残留一个未以空行结尾的事件
           const tail = buffer.trim();
           if (tail.startsWith("data:")) {
             const payload = tail.slice(5).trim();
@@ -219,7 +235,6 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
 
         buffer += decoder.decode(value, { stream: true });
 
-        // 兼容 \n\n / \r\n\r\n 事件边界
         let idx: number;
         while (
           (idx = buffer.indexOf("\n\n")) !== -1 ||
@@ -252,26 +267,22 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
               return;
             }
 
-            // 解析增量
             let j: any;
-            try { j = JSON.parse(payload); } catch { continue; } // 心跳或非 JSON 行
+            try { j = JSON.parse(payload); } catch { continue; }
 
             const delta = j?.choices?.[0]?.delta;
-            const chunk =
-              typeof delta?.content === "string" ? delta.content : "";
+            const chunk = typeof delta?.content === "string" ? delta.content : "";
             const hasRoleOnly = delta?.role && !chunk;
 
-            if (hasRoleOnly) continue;                // 第一包可能只有 role
-            if (!chunk || !chunk.trim()) continue;    // 纯空/空白：丢弃
+            if (hasRoleOnly) continue;
+            if (!chunk || !chunk.trim()) continue;
 
-            // 累积全文 + 首块去前导空格
             acc += chunk;
             if (!sentAny && acc.length > 0) {
               acc = acc.replace(/^\s+/, "");
               sentAny = true;
             }
 
-            // 每次把“截至当前的完整文本”推给前端（避免 H e low / 空白）
             controller.enqueue(
               encoder.encode(`data: ${JSON.stringify({ response: acc, done: false })}\n\n`)
             );
