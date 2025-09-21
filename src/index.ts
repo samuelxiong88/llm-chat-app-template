@@ -1,26 +1,23 @@
 /**
- * LLM Chat App on Cloudflare Workers — OpenAI backend (final unified)
- * - /api/debug  查看环境变量
- * - /api/ping   GET /v1/models 验证 KEY/网络
- * - /api/chat   GET → 直通 OpenAI SSE；POST → 解析为 {response,done}
+ * Minimal passthrough: Cloudflare Worker → OpenAI Chat Completions (SSE)
+ * Endpoints:
+ *   GET  /api/chat?q=hello        // 调试/EventSource 兼容
+ *   POST /api/chat {messages:[...]}// 标准调用
+ *   GET  /api/ping                // 连通性自检
+ *   GET  /api/debug               // 变量自检
+ *   GET  /                        // 简单兜底页（ASSETS 未绑定时）
  */
 
-import type { Env, ChatMessage } from "./types";
+import type { Env } from "./types";
 
+const DEFAULT_API_BASE = "https://api.openai.com/v1";
 const SYSTEM_PROMPT =
   "You are a helpful, friendly assistant. Provide concise and accurate responses.";
-const DEFAULT_API_BASE = "https://api.openai.com/v1";
 
-// GPT-5 / realtime / audio 不接受自定义 temperature
-function modelSupportsTemperature(model: string): boolean {
-  const m = (model || "").toLowerCase();
-  return !(m.startsWith("gpt-5") || m.includes("realtime") || m.includes("audio"));
-}
-
-function jsonResponse(obj: unknown, status = 200): Response {
+function json(obj: unknown, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" },
+    headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" }
   });
 }
 
@@ -29,8 +26,9 @@ export default {
     try {
       const url = new URL(request.url);
       const apiBase = env.OPENAI_API_BASE || DEFAULT_API_BASE;
+      const model = env.OPENAI_MODEL || "gpt-4o";
 
-      // ===== 静态资源（前端）兜底 =====
+      // ==== 静态资源（兜底）====
       if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
         try {
           if (env.ASSETS && typeof (env.ASSETS as any).fetch === "function") {
@@ -41,13 +39,17 @@ export default {
 <title>LLM Chat</title>
 <body style="font-family:system-ui;margin:40px">
 <h2>LLM Chat App</h2>
-<p>Assets binding <code>ASSETS</code> not configured. API endpoints:</p>
-<ul><li><code>/api/ping</code></li><li><code>/api/chat</code></li><li><code>/api/debug</code></li></ul>
+<p>Assets not configured. Test endpoints:</p>
+<ul>
+  <li><code>/api/ping</code></li>
+  <li><code>/api/chat?q=hello</code></li>
+  <li><code>/api/debug</code></li>
+</ul>
 </body>`;
         return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
       }
 
-      // ===== CORS 预检 =====
+      // ==== CORS 预检 ====
       if (request.method === "OPTIONS") {
         return new Response(null, {
           headers: {
@@ -59,16 +61,16 @@ export default {
         });
       }
 
-      // ===== /api/debug =====
+      // ==== /api/debug ====
       if (url.pathname === "/api/debug") {
-        return jsonResponse({
+        return json({
           OPENAI_API_KEY: env.OPENAI_API_KEY ? "set" : "not set",
           OPENAI_MODEL: env.OPENAI_MODEL || "not set",
           OPENAI_API_BASE: env.OPENAI_API_BASE || "not set",
         });
       }
 
-      // ===== /api/ping =====
+      // ==== /api/ping ====
       if (url.pathname === "/api/ping") {
         try {
           const r = await fetch(`${apiBase}/models`, {
@@ -80,229 +82,77 @@ export default {
             headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" },
           });
         } catch (e) {
-          return jsonResponse({ error: String(e) }, 500);
+          return json({ error: String(e) }, 500);
         }
       }
 
-      // ===== /api/chat =====
+      // ==== /api/chat ====
       if (url.pathname === "/api/chat") {
-        // GET: 直通 OpenAI SSE
+        // 1) 组装 messages（GET 用 q，POST 用 body）
+        let messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
         if (request.method === "GET") {
           const q = url.searchParams.get("q") || "Hello";
-          const model = env.OPENAI_MODEL || "gpt-4o";
-          const supportsTemp = modelSupportsTemperature(model);
-          const payload: any = {
-            model,
-            stream: true,
-            messages: [
-              { role: "system", content: SYSTEM_PROMPT },
-              { role: "user", content: q },
-            ],
-          };
-          if (supportsTemp) payload.temperature = 0.2;
-
-          const upstream = await fetch(`${apiBase}/chat/completions`, {
-            method: "POST",
-            headers: {
-              "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify(payload),
-          });
-
-          if (!upstream.ok || !upstream.body) {
-            const detail = await upstream.text().catch(() => "");
-            return jsonResponse(
-              { error: "OpenAI upstream error (GET passthrough)", status: upstream.status, detail },
-              upstream.status
-            );
+          messages = [
+            { role: "system", content: SYSTEM_PROMPT },
+            { role: "user", content: q }
+          ];
+        } else if (request.method === "POST") {
+          try {
+            const body = await request.json();
+            const userMsgs = Array.isArray(body?.messages) ? body.messages : [];
+            messages = userMsgs.length
+              ? userMsgs
+              : [{ role: "user", content: "Hello" }];
+            if (!messages.some((m) => m.role === "system")) {
+              messages.unshift({ role: "system", content: SYSTEM_PROMPT });
+            }
+          } catch {
+            return json({ error: "Invalid JSON body" }, 400);
           }
-
-          return new Response(upstream.body, {
-            headers: {
-              "Content-Type": "text/event-stream; charset=utf-8",
-              "Cache-Control": "no-cache",
-              "Connection": "keep-alive",
-              "Access-Control-Allow-Origin": "*",
-            },
-          });
+        } else {
+          return json({ error: "Method not allowed" }, 405);
         }
 
-        // POST: 解析累积输出
-        if (request.method !== "POST") return jsonResponse({ error: "Method not allowed" }, 405);
-        return handleChat(request, env);
+        // 2) 调 OpenAI（不传 temperature，避免 gpt-5* 报错）
+        const upstream = await fetch(`${apiBase}/chat/completions`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model,
+            messages,
+            stream: true,     // 关键：开启流式
+          }),
+        });
+
+        // 3) 失败时返回 JSON，便于定位
+        if (!upstream.ok || !upstream.body) {
+          const detail = await upstream.text().catch(() => "");
+          return json(
+            { error: "OpenAI upstream error", status: upstream.status, detail },
+            upstream.status
+          );
+        }
+
+        // 4) 直通 OpenAI 原始 SSE（最稳）
+        return new Response(upstream.body, {
+          headers: {
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            // 可选：有些反代需要这一行避免缓冲
+            // "X-Accel-Buffering": "no",
+          },
+        });
       }
 
-      return jsonResponse({ error: "Not found" }, 404);
+      return json({ error: "Not found" }, 404);
     } catch (e) {
-      return jsonResponse({ error: "Worker exception", detail: String(e) }, 500);
+      // 避免 1101，统一返回 JSON
+      return json({ error: "Worker exception", detail: String(e) }, 500);
     }
   },
 } satisfies ExportedHandler<Env>;
-
-async function handleChat(request: Request, env: Env): Promise<Response> {
-  try {
-    const apiBase = env.OPENAI_API_BASE || DEFAULT_API_BASE;
-    const model = env.OPENAI_MODEL || "gpt-4o";
-
-    const url = new URL(request.url);
-    const debugJson = url.searchParams.get("mode") === "json";
-
-    let body: any;
-    try {
-      body = await request.json();
-    } catch {
-      return jsonResponse({ error: "Invalid JSON body" }, 400);
-    }
-    const messages: ChatMessage[] = Array.isArray(body?.messages) ? body.messages : [];
-    if (!messages.some((m) => m.role === "system")) {
-      messages.unshift({ role: "system", content: SYSTEM_PROMPT });
-    }
-
-    const payload: any = { model, messages, stream: !debugJson };
-    if (modelSupportsTemperature(model)) payload.temperature = 0.2;
-
-    if (debugJson) {
-      const r = await fetch(`${apiBase}/chat/completions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      });
-      const text = await r.text();
-      return new Response(text, {
-        status: r.status,
-        headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
-    }
-
-    const upstream = await fetch(`${apiBase}/chat/completions`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (!upstream.ok || !upstream.body) {
-      const detail = await upstream.text().catch(() => "");
-      return jsonResponse({ error: "OpenAI upstream error", status: upstream.status, detail }, upstream.status);
-    }
-
-    const encoder = new TextEncoder();
-    const decoder = new TextDecoder();
-    const reader = upstream.body.getReader();
-
-    let buffer = "";
-    let acc = "";
-    let sentAny = false;
-
-    const stream = new ReadableStream<Uint8Array>({
-      async pull(controller) {
-        const { value, done } = await reader.read();
-
-        if (done) {
-          const tail = buffer.trim();
-          if (tail.startsWith("data:")) {
-            const payload = tail.slice(5).trim();
-            if (payload !== "[DONE]") {
-              try {
-                const j = JSON.parse(payload);
-                const chunk =
-                  typeof j?.choices?.[0]?.delta?.content === "string"
-                    ? j.choices[0].delta.content
-                    : "";
-                if (chunk.trim().length > 0) acc += chunk;
-              } catch {}
-            }
-          }
-          if (!sentAny && acc.length > 0) {
-            acc = acc.replace(/^\s+/, "");
-            sentAny = true;
-          }
-          if (acc.length > 0) {
-            controller.enqueue(
-              encoder.encode(`data: ${JSON.stringify({ response: acc, done: false })}\n\n`)
-            );
-          }
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true })}\n\n`));
-          controller.close();
-          return;
-        }
-
-        buffer += decoder.decode(value, { stream: true });
-
-        let idx: number;
-        while (
-          (idx = buffer.indexOf("\n\n")) !== -1 ||
-          (idx = buffer.indexOf("\r\n\r\n")) !== -1
-        ) {
-          const useCRLF =
-            buffer.indexOf("\r\n\r\n") !== -1 && idx === buffer.indexOf("\r\n\r\n");
-          const sepLen = useCRLF ? 4 : 2;
-
-          const block = buffer.slice(0, idx);
-          buffer = buffer.slice(idx + sepLen);
-
-          for (const line of block.split(/\r?\n/)) {
-            const l = line.trim();
-            if (!l.startsWith("data:")) continue;
-            const payload = l.slice(5).trim();
-
-            if (payload === "[DONE]") {
-              if (!sentAny && acc.length > 0) {
-                acc = acc.replace(/^\s+/, "");
-                sentAny = true;
-              }
-              if (acc.length > 0) {
-                controller.enqueue(
-                  encoder.encode(`data: ${JSON.stringify({ response: acc, done: false })}\n\n`)
-                );
-              }
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true })}\n\n`));
-              controller.close();
-              return;
-            }
-
-            let j: any;
-            try { j = JSON.parse(payload); } catch { continue; }
-
-            const delta = j?.choices?.[0]?.delta;
-            const chunk = typeof delta?.content === "string" ? delta.content : "";
-            const hasRoleOnly = delta?.role && !chunk;
-
-            if (hasRoleOnly) continue;
-            if (!chunk || !chunk.trim()) continue;
-
-            acc += chunk;
-            if (!sentAny && acc.length > 0) {
-              acc = acc.replace(/^\s+/, "");
-              sentAny = true;
-            }
-
-            controller.enqueue(
-              encoder.encode(`data: ${JSON.stringify({ response: acc, done: false })}\n\n`)
-            );
-          }
-        }
-      },
-      cancel() {
-        try { reader.cancel(); } catch {}
-      },
-    });
-
-    return new Response(stream, {
-      headers: {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "Access-Control-Allow-Origin": "*",
-      },
-    });
-  } catch (e) {
-    return jsonResponse({ error: "handleChat exception", detail: String(e) }, 500);
-  }
-}
