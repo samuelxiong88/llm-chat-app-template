@@ -4,7 +4,6 @@ if (payload === "[DONE]") {interface Env {
   OPENAI_API_BASE?: string;
   ASSETS: { fetch: (request: Request) => Promise<Response> };
 }
-
 interface ChatMessage {
   role: string;
   content: string;
