@@ -9,7 +9,6 @@ interface ChatMessage {
   role: string;
   content: string;
 }
-
 const SYSTEM_PROMPT =
   "You are a helpful, friendly assistant. Provide concise and accurate responses.";
 
