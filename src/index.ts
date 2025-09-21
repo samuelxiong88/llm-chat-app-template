@@ -212,7 +212,6 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
                   try {
 const json = JSON.parse(payload);
 const delta = json.choices?.[0]?.delta;
-
 // 仅当有真正文本增量时才推送
 const content = typeof delta?.content === "string" ? delta.content : "";
 if (content.trim().length === 0) {
