@@ -140,7 +140,7 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
     const maxRetries = 2;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 60000);
+      const timeoutId = setTimeout(() => controller.abort(), 120000); // 增加到120秒
 
       try {
         const upstream = await fetch(`${apiBase}/chat/completions`, {
@@ -204,7 +204,7 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
                   if (!l.startsWith("data:")) continue;
                   const payload = l.slice(5).trim();
                   console.log("Parsed payload:", payload);
-                  if (payload === "[DONE]") {
+                  if (payload === "[DONE]" || payload.includes('"finish_reason":"stop"')) {
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true })}\n\n`));
                     controller.close();
                     return;
@@ -212,8 +212,9 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
                   try {
                     const json = JSON.parse(payload);
                     const delta = json.choices?.[0]?.delta;
-                    const content = delta?.content || (delta?.role === "assistant" ? "" : null);
-                    if (content !== null) {
+                    let content = delta?.content;
+                    if (!content && delta?.role === "assistant") content = "";
+                    if (content !== undefined) {
                       controller.enqueue(
                         encoder.encode(`data: ${JSON.stringify({ response: content, done: false })}\n\n`)
                       );
