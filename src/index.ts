@@ -16,7 +16,24 @@ const SYSTEM_PROMPT =
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-
+// 自检路由：验证 API Key 和连通性
+if (url.pathname === "/api/ping") {
+  try {
+    const r = await fetch("https://api.openai.com/v1/models", {
+      headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+    });
+    const text = await r.text();
+    return new Response(text, {
+      status: r.status,
+      headers: { "content-type": "application/json" },
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), {
+      status: 500,
+      headers: { "content-type": "application/json" },
+    });
+  }
+}
     // 前端静态资源
     if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
       return env.ASSETS.fetch(request);
