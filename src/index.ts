@@ -1,4 +1,4 @@
-interface Env {
+if (payload === "[DONE]") {interface Env {
   OPENAI_API_KEY: string;
   OPENAI_MODEL?: string;
   OPENAI_API_BASE?: string;
@@ -210,17 +210,19 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
                     return;
                   }
                   try {
-                    const json = JSON.parse(payload);
-                    const delta = json.choices?.[0]?.delta;
-                    let content = delta?.content;
-                    if (!content && delta?.role === "assistant") content = "";
-                    if (content !== undefined) {
-                      controller.enqueue(
-                        encoder.encode(`data: ${JSON.stringify({ response: content, done: false })}\n\n`)
-                      );
-                    } else {
-                      console.warn("No usable content in delta:", json);
-                    }
+const json = JSON.parse(payload);
+const delta = json.choices?.[0]?.delta;
+
+// 仅当有真正文本增量时才推送
+const content = typeof delta?.content === "string" ? delta.content : "";
+if (content.trim().length === 0) {
+  // 忽略空块/仅有 role 的块，避免前端渲染空白
+  continue;
+}
+
+controller.enqueue(
+  encoder.encode(`data: ${JSON.stringify({ response: content, done: false })}\n\n`)
+);
                   } catch (e) {
                     console.error(`Failed to parse SSE payload: ${payload}, error: ${e}`);
                   }
