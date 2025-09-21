@@ -31,8 +31,24 @@ export default {
 
     // 静态资源
     if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
-      return env.ASSETS.fetch(req);
+  try {
+    if (env.ASSETS && typeof (env.ASSETS as any).fetch === "function") {
+      return env.ASSETS.fetch(request);
     }
+    // 临时兜底：简单的 HTML
+    const html = `<!doctype html><html><body>
+      <h2>LLM Chat App</h2>
+      <p>Assets binding not configured. API endpoints are available:</p>
+      <ul>
+        <li><code>/api/ping</code></li>
+        <li><code>/api/chat</code></li>
+      </ul>
+    </body></html>`;
+    return new Response(html, { headers: { "content-type": "text/html" } });
+  } catch (e) {
+    return new Response("Assets error: " + String(e), { status: 500 });
+  }
+}
 
     // CORS 预检
     if (req.method === "OPTIONS") {
