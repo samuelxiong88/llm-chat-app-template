@@ -90,7 +90,6 @@ export default {
     });
   },
 } satisfies ExportedHandler<Env>;
-
 async function handleChat(request: Request, env: Env): Promise<Response> {
   const apiBase = env.OPENAI_API_BASE || "https://api.openai.com/v1";
   const model = env.OPENAI_MODEL || "gpt-4o";
