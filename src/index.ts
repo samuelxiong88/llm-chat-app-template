@@ -25,7 +25,7 @@ const JSON = (obj: unknown, status = 200) =>
   });
 
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: req, env: Env): Promise<Response> {
     const url = new URL(req.url);
     const apiBase = env.OPENAI_API_BASE || DEFAULT_API_BASE;
 
