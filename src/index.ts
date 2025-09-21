@@ -33,7 +33,7 @@ export default {
     if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
   try {
     if (env.ASSETS && typeof (env.ASSETS as any).fetch === "function") {
-      return env.ASSETS.fetch(request);
+      return env.ASSETS.fetch(req);
     }
     // 临时兜底：简单的 HTML
     const html = `<!doctype html><html><body>
