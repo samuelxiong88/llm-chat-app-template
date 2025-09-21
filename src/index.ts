@@ -1,3 +1,9 @@
+/**
+ * LLM Chat App on Cloudflare Workers — OpenAI backend (SSE final)
+ * - /api/ping  自检：验证 Key/连通性（GET /v1/models）
+ * - /api/chat  流式：chat/completions + SSE，适配模板前端事件格式
+ */
+
 import type { Env, ChatMessage } from "./types";
 
 const SYSTEM_PROMPT =
@@ -12,7 +18,7 @@ export default {
       return env.ASSETS.fetch(request);
     }
 
-    // 自检：可选，保留方便排错
+    // 自检：可选保留
     if (url.pathname === "/api/ping") {
       const r = await fetch("https://api.openai.com/v1/models", {
         headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
@@ -47,12 +53,15 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
   try {
     const { messages = [] } = (await request.json()) as { messages: ChatMessage[] };
 
-    // 补 system
+    // 保底 system
     if (!messages.some((m) => m.role === "system")) {
       messages.unshift({ role: "system", content: SYSTEM_PROMPT });
     }
 
-    const model = (env as any).OPENAI_MODEL || "gpt-5-mini"; // 先用 mini 稳妥
+    // 先用 OPENAI_MODEL（如 gpt-4o / gpt-5-mini），否则默认 gpt-4o
+    const model = (env as any).OPENAI_MODEL || "gpt-4o";
+
+    // 调用 OpenAI（流式）
     const upstream = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -62,12 +71,12 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
       body: JSON.stringify({
         model,
         messages,
-        stream: true,       // 开启流式
+        stream: true,
         temperature: 0.2,
       }),
     });
 
-    // 上游直接失败就把错误回给前端（便于定位）
+    // 上游失败：把错误直接回给前端，便于定位
     if (!upstream.ok || !upstream.body) {
       const detail = await upstream.text().catch(() => "");
       return new Response(
@@ -76,7 +85,7 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
       );
     }
 
-    // 将 OpenAI 的 SSE 解析成模板期望的事件：{"response":"…","done":false} / {"done":true}
+    // 将 OpenAI 的 SSE 转成模板事件：{"response":"…","done":false} / {"done":true}
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
     const reader = upstream.body.getReader();
@@ -90,21 +99,25 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
           controller.close();
           return;
         }
+
         buf += decoder.decode(value, { stream: true });
 
         let idx;
         while ((idx = buf.indexOf("\n\n")) !== -1) {
           const event = buf.slice(0, idx);
           buf = buf.slice(idx + 2);
+
           for (const line of event.split("\n")) {
             const l = line.trim();
             if (!l.startsWith("data:")) continue;
+
             const payload = l.slice(5).trim();
             if (payload === "[DONE]") {
               controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true })}\n\n`));
               controller.close();
               return;
             }
+
             try {
               const json = JSON.parse(payload);
               const delta = json.choices?.[0]?.delta;
@@ -114,11 +127,15 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
                   encoder.encode(`data: ${JSON.stringify({ response: text, done: false })}\n\n`)
                 );
               }
-            } catch { /* 忽略心跳/非 JSON 行 */ }
+            } catch {
+              // 忽略非 JSON/心跳行
+            }
           }
         }
       },
-      cancel() { try { reader.cancel(); } catch {} },
+      cancel() {
+        try { reader.cancel(); } catch {}
+      },
     });
 
     return new Response(stream, {
