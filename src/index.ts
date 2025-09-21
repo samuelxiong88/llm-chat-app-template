@@ -138,7 +138,7 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
       Authorization: `Bearer ${env.OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ model, messages, stream: true, temperature: 0.2 }),
+    body: JSON.stringify({ model, messages, stream: true }),
   });
 
   if (!upstream.ok || !upstream.body) {
