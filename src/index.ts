@@ -17,11 +17,9 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const apiBase = env.OPENAI_API_BASE || "https://api.openai.com/v1";
-    // 前端静态资源
     if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
       return env.ASSETS.fetch(request);
     }
-    // 调试端点：返回环境变量状态
     if (url.pathname === "/api/debug") {
       return new Response(
         JSON.stringify({
@@ -38,21 +36,31 @@ export default {
         }
       );
     }
-    // 自检：检查 API 密钥和连通性
     if (url.pathname === "/api/ping") {
-      const r = await fetch(`${apiBase}/models`, {
-        headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
-      });
-      const text = await r.text();
-      return new Response(text, {
-        status: r.status,
-        headers: {
-          "content-type": "application/json",
-          "Access-Control-Allow-Origin": "*",
-        },
-      });
+      try {
+        const r = await fetch(`${apiBase}/models`, {
+          headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+        });
+        const text = await r.text();
+        console.log("Ping response status:", r.status);
+        return new Response(text, {
+          status: r.status,
+          headers: {
+            "content-type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        });
+      } catch (e) {
+        console.error("Ping error:", e);
+        return new Response(JSON.stringify({ error: "Ping failed" }), {
+          status: 500,
+          headers: {
+            "content-type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        });
+      }
     }
-    // 聊天
     if (url.pathname === "/api/chat") {
       if (request.method === "OPTIONS") {
         return new Response(null, {
@@ -87,10 +95,25 @@ export default {
 
 async function handleChat(request: Request, env: Env): Promise<Response> {
   try {
+    const pingResponse = await fetch(`${env.OPENAI_API_BASE || "https://api.openai.com/v1"}/models`, {
+      headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+    });
+    if (!pingResponse.ok) {
+      const errorDetail = await pingResponse.text();
+      console.error("API key validation failed:", errorDetail);
+      return new Response(JSON.stringify({ error: "Invalid API key", detail: errorDetail }), {
+        status: 401,
+        headers: {
+          "content-type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
+
     let body;
     try {
       body = await request.json();
-      console.log("Received request body:", body);
+      console.log("Received request body:", JSON.stringify(body, null, 2));
     } catch (e) {
       console.error("Invalid JSON body:", e);
       return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
@@ -104,21 +127,20 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
     const messages = Array.isArray(body.messages) ? body.messages : [];
     if (!messages.length) {
       console.warn("No messages provided in request body");
+    } else {
+      console.log("Messages:", messages.map(m => ({ role: m.role, content: m.content.slice(0, 20) + (m.content.length > 20 ? "..." : "") })));
     }
-    // 保底 system
     if (!messages.some((m) => m.role === "system")) {
       messages.unshift({ role: "system", content: SYSTEM_PROMPT });
     }
-    // 先用 OPENAI_MODEL（如 gpt-4o / gpt-5-mini），否则默认 gpt-4o
     const model = env.OPENAI_MODEL || "gpt-4o";
     const apiBase = env.OPENAI_API_BASE || "https://api.openai.com/v1";
     console.log("Using model:", model, "API base:", apiBase);
 
-    // 添加超时和重试逻辑
     const maxRetries = 2;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30秒超时
+      const timeoutId = setTimeout(() => controller.abort(), 60000);
 
       try {
         const upstream = await fetch(`${apiBase}/chat/completions`, {
@@ -137,12 +159,13 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
         });
         clearTimeout(timeoutId);
 
-        console.log("Upstream response status:", upstream.status);
+        console.log("Upstream response status:", upstream.status, "headers:", Object.fromEntries(upstream.headers));
         if (!upstream.ok || !upstream.body) {
-          const detail = await upstream.text().catch(() => "");
+          const detail = await upstream.text().catch(() => "No detail available");
           console.error("Upstream error:", { status: upstream.status, detail });
           if (attempt < maxRetries) {
             console.log(`Retrying (${attempt + 1}/${maxRetries})...`);
+            await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
             continue;
           }
           return new Response(
@@ -163,41 +186,48 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
         let buf = "";
         const stream = new ReadableStream<Uint8Array>({
           async pull(controller) {
-            const { value, done } = await reader.read();
-            if (done) {
-              console.log("Stream completed");
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true })}\n\n`));
-              controller.close();
-              return;
-            }
-            buf += decoder.decode(value, { stream: true });
-            let idx;
-            while ((idx = buf.indexOf("\n\n")) !== -1) {
-              const event = buf.slice(0, idx);
-              buf = buf.slice(idx + 2);
-              for (const line of event.split("\n")) {
-                const l = line.trim();
-                if (!l.startsWith("data:")) continue;
-                const payload = l.slice(5).trim();
-                console.log("Parsed payload:", payload);
-                if (payload === "[DONE]") {
-                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true })}\n\n`));
-                  controller.close();
-                  return;
-                }
-                try {
-                  const json = JSON.parse(payload);
-                  const delta = json.choices?.[0]?.delta;
-                  const text = typeof delta?.content === "string" ? delta.content : "";
-                  if (text) {
-                    controller.enqueue(
-                      encoder.encode(`data: ${JSON.stringify({ response: text, done: false })}\n\n`)
-                    );
+            try {
+              const { value, done } = await reader.read();
+              if (done) {
+                console.log("Stream completed");
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true })}\n\n`));
+                controller.close();
+                return;
+              }
+              buf += decoder.decode(value, { stream: true });
+              let idx;
+              while ((idx = buf.indexOf("\n\n")) !== -1) {
+                const event = buf.slice(0, idx);
+                buf = buf.slice(idx + 2);
+                for (const line of event.split("\n")) {
+                  const l = line.trim();
+                  if (!l.startsWith("data:")) continue;
+                  const payload = l.slice(5).trim();
+                  console.log("Parsed payload:", payload);
+                  if (payload === "[DONE]") {
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true })}\n\n`));
+                    controller.close();
+                    return;
                   }
-                } catch (e) {
-                  console.error(`Failed to parse SSE payload: ${payload}, error: ${e}`);
+                  try {
+                    const json = JSON.parse(payload);
+                    const delta = json.choices?.[0]?.delta;
+                    const content = delta?.content || (delta?.role === "assistant" ? "" : null);
+                    if (content !== null) {
+                      controller.enqueue(
+                        encoder.encode(`data: ${JSON.stringify({ response: content, done: false })}\n\n`)
+                      );
+                    } else {
+                      console.warn("No usable content in delta:", json);
+                    }
+                  } catch (e) {
+                    console.error(`Failed to parse SSE payload: ${payload}, error: ${e}`);
+                  }
                 }
               }
+            } catch (e) {
+              console.error("Stream pull error:", e);
+              controller.error(e);
             }
           },
           cancel() {
@@ -221,7 +251,7 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
         console.error(`Fetch error (attempt ${attempt}/${maxRetries}):`, e);
         if (attempt < maxRetries) {
           console.log(`Retrying (${attempt + 1}/${maxRetries})...`);
-          await new Promise((resolve) => setTimeout(resolve, 1000 * attempt)); // 指数退避
+          await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
           continue;
         }
         throw e;
@@ -229,8 +259,8 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
     }
     throw new Error("Max retries reached");
   } catch (e) {
-    console.error("HandleChat error:", e);
-    return new Response(JSON.stringify({ error: String(e) }), {
+    console.error("HandleChat error:", e, "Stack:", e.stack);
+    return new Response(JSON.stringify({ error: String(e), stack: e.stack }), {
       status: 500,
       headers: {
         "content-type": "application/json",
