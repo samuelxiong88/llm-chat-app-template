@@ -1,7 +1,9 @@
 /**
- * LLM Chat App Frontend
+ * LLM Chat App Frontend  (EventSource + OpenAI raw SSE)
  *
  * Handles the chat UI interactions and communication with the backend API.
+ * 后端返回 OpenAI 原始事件（choices[0].delta.content），
+ * 这里用 EventSource(GET) 读取，并把增量文本累积后渲染。
  */
 
 // DOM elements
@@ -10,7 +12,7 @@ const userInput = document.getElementById("user-input");
 const sendButton = document.getElementById("send-button");
 const typingIndicator = document.getElementById("typing-indicator");
 
-// Chat state
+// Chat state（仍然保留历史，方便你以后切回 POST）
 let chatHistory = [
   {
     role: "assistant",
@@ -19,6 +21,7 @@ let chatHistory = [
   },
 ];
 let isProcessing = false;
+let esRef = null; // 当前 EventSource 连接
 
 // Auto-resize textarea as user types
 userInput.addEventListener("input", function () {
@@ -38,12 +41,11 @@ userInput.addEventListener("keydown", function (e) {
 sendButton.addEventListener("click", sendMessage);
 
 /**
- * Sends a message to the chat API and processes the response
+ * Sends a message to the chat API (EventSource GET) and processes the response
+ * 方案 A：把用户输入放进 ?q=，后端会转为对 OpenAI 的 POST，并原样转发 SSE。
  */
 async function sendMessage() {
   const message = userInput.value.trim();
-
-  // Don't send empty messages
   if (message === "" || isProcessing) return;
 
   // Disable input while processing
@@ -61,80 +63,74 @@ async function sendMessage() {
   // Show typing indicator
   typingIndicator.classList.add("visible");
 
-  // Add message to history
+  // Add message to local history（仅用于展示/以后扩展）
   chatHistory.push({ role: "user", content: message });
 
-  try {
-    // Create new assistant response element
-    const assistantMessageEl = document.createElement("div");
-    assistantMessageEl.className = "message assistant-message";
-    assistantMessageEl.innerHTML = "<p></p>";
-    chatMessages.appendChild(assistantMessageEl);
+  // 如有旧连接，先关闭
+  if (esRef && typeof esRef.close === "function") {
+    try { esRef.close(); } catch {}
+  }
 
-    // Scroll to bottom
-    chatMessages.scrollTop = chatMessages.scrollHeight;
+  // Create new assistant response element（渲染增量到同一个气泡）
+  const assistantMessageEl = document.createElement("div");
+  assistantMessageEl.className = "message assistant-message";
+  assistantMessageEl.innerHTML = "<p></p>";
+  chatMessages.appendChild(assistantMessageEl);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
 
-    // Send request to API
-    const response = await fetch("/api/chat", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        messages: chatHistory,
-      }),
-    });
+  // ---- EventSource(GET) 建立连接 ----
+  // 说明：如果你的 Worker 同时兼容 /chat 与 /api/chat，任选其一即可。
+  // 这里统一用 /api/chat
+  const es = new EventSource(`/api/chat?q=${encodeURIComponent(message)}`);
+  esRef = es;
 
-    // Handle errors
-    if (!response.ok) {
-      throw new Error("Failed to get response");
+  let acc = "";       // 累计文本
+  let closed = false; // 防止多次 close
+
+  es.onmessage = (e) => {
+    // OpenAI 的流以 "[DONE]" 收尾
+    if (e.data === "[DONE]") {
+      safeClose();
+      return;
     }
 
-    // Process streaming response
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let responseText = "";
+    // 个别事件不是 JSON（心跳等），用 try/catch 保护
+    try {
+      const obj = JSON.parse(e.data);
+      const delta = obj?.choices?.[0]?.delta || {};
 
-    while (true) {
-      const { done, value } = await reader.read();
+      // 第一包常常只有 role（没有 content），忽略即可
+      if (typeof delta.content === "string") {
+        acc += delta.content;
+        assistantMessageEl.querySelector("p").textContent = acc;
 
-      if (done) {
-        break;
+        // 滚动到底部
+        chatMessages.scrollTop = chatMessages.scrollHeight;
       }
-
-      // Decode chunk
-      const chunk = decoder.decode(value, { stream: true });
-
-      // Process SSE format
-      const lines = chunk.split("\n");
-      for (const line of lines) {
-        try {
-          const jsonData = JSON.parse(line);
-          if (jsonData.response) {
-            // Append new content to existing text
-            responseText += jsonData.response;
-            assistantMessageEl.querySelector("p").textContent = responseText;
-
-            // Scroll to bottom
-            chatMessages.scrollTop = chatMessages.scrollHeight;
-          }
-        } catch (e) {
-          console.error("Error parsing JSON:", e);
-        }
-      }
+    } catch {
+      // 非 JSON 事件忽略
     }
+  };
 
-    // Add completed response to chat history
-    chatHistory.push({ role: "assistant", content: responseText });
-  } catch (error) {
-    console.error("Error:", error);
-    addMessageToChat(
-      "assistant",
-      "Sorry, there was an error processing your request.",
-    );
-  } finally {
-    // Hide typing indicator
+  es.onerror = () => {
+    // 连接或网络错误
+    safeClose("Sorry, there was a connection error.");
+  };
+
+  function safeClose(errorText) {
+    if (closed) return;
+    closed = true;
+    try { es.close(); } catch {}
+
+    // 隐藏 typing
     typingIndicator.classList.remove("visible");
+
+    // 把累计的回答写入历史；若异常且没有任何内容，显示错误
+    if (acc && acc.trim().length > 0) {
+      chatHistory.push({ role: "assistant", content: acc });
+    } else if (errorText) {
+      assistantMessageEl.querySelector("p").textContent = errorText;
+    }
 
     // Re-enable input
     isProcessing = false;
