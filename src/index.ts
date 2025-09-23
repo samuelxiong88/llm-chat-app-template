@@ -18,22 +18,35 @@ function json(obj: unknown, status = 200): Response {
     headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" },
   });
 }
-function sseLine(s: string) { return te.encode(s); }
-function sseData(o: unknown) { return sseLine(`data: ${JSON.stringify(o)}\n\n`); }
-function sseDone() { return sseLine(`data: [DONE]\n\n`); }
+function sseData(o: unknown) {
+  return te.encode(`data: ${JSON.stringify(o)}\n\n`);
+}
+function sseDone() {
+  return te.encode(`data: [DONE]\n\n`);
+}
 function sseErrorResponse(status: number, detail: string) {
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      controller.enqueue(sseData({
-        id: "cmpl-error",
-        object: "chat.completion.chunk",
-        choices: [{ index: 0, delta: { content: `⚠️ Upstream error ${status}: ${String(detail).slice(0, 1000)}` }, finish_reason: null }],
-      }));
-      controller.enqueue(sseData({
-        id: "cmpl-stop",
-        object: "chat.completion.chunk",
-        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-      }));
+      controller.enqueue(
+        sseData({
+          id: "cmpl-error",
+          object: "chat.completion.chunk",
+          choices: [
+            {
+              index: 0,
+              delta: { content: `⚠️ Upstream error ${status}: ${String(detail).slice(0, 1000)}` },
+              finish_reason: null,
+            },
+          ],
+        })
+      );
+      controller.enqueue(
+        sseData({
+          id: "cmpl-stop",
+          object: "chat.completion.chunk",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        })
+      );
       controller.enqueue(sseDone());
       controller.close();
     },
@@ -99,7 +112,9 @@ export default {
       // /api/ping
       if (url.pathname === "/api/ping") {
         try {
-          const r = await fetch(`${apiBase}/models`, { headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` } });
+          const r = await fetch(`${apiBase}/models`, {
+            headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+          });
           const text = await r.text();
           return new Response(text, {
             status: r.status,
@@ -172,9 +187,8 @@ export default {
         // 原生工具（交给 OpenAI 服务端编排）。若关闭或未开通，将在下方自动回退。
         if (enableNativeTools) {
           basePayload.tools = [
-            { type: "web_search_preview" }, // ← 你也可换为 "web_search_preview_2025_03_11"
-            { type: "file_search" },
-            { type: "code_interpreter" },
+            { type: "web_search_preview" },   // 你也可改成 web_search_preview_2025_03_11
+            { type: "code_interpreter" }
           ];
           basePayload.tool_choice = "auto";
         }
@@ -193,7 +207,7 @@ export default {
           body: JSON.stringify(payload),
         });
 
-        // 若 400 因 tools/reasoning/sampling 不被支持，自动回退
+        // 若 400 因 tools/参数不被支持，自动回退
         if (!upstream.ok) {
           const firstDetail = await upstream.text().catch(() => "");
           const isToolInvalidOrUnsupported =
@@ -207,7 +221,6 @@ export default {
             /Unsupported parameter.*reasoning\.effort/i.test(firstDetail);
 
           if (isToolInvalidOrUnsupported || badSampling || badReasoning) {
-            // 回退为最小通用 payload（无 tools、无不支持参数）
             payload = {
               model,
               input: messages,
@@ -235,12 +248,13 @@ export default {
 
         const out = new ReadableStream<Uint8Array>({
           start(controller) {
-            // 起始：role=assistant
-            controller.enqueue(sseData({
-              id: "cmpl-start",
-              object: "chat.completion.chunk",
-              choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
-            }));
+            controller.enqueue(
+              sseData({
+                id: "cmpl-start",
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+              })
+            );
 
             const decoder = new TextDecoder("utf-8");
             let buffer = "";
@@ -249,18 +263,22 @@ export default {
 
             const pushDelta = (text: string) => {
               if (!text) return;
-              controller.enqueue(sseData({
-                id: "cmpl-chunk",
-                object: "chat.completion.chunk",
-                choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-              }));
+              controller.enqueue(
+                sseData({
+                  id: "cmpl-chunk",
+                  object: "chat.completion.chunk",
+                  choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+                })
+              );
             };
             const pushStop = (reason = "stop") => {
-              controller.enqueue(sseData({
-                id: "cmpl-stop",
-                object: "chat.completion.chunk",
-                choices: [{ index: 0, delta: {}, finish_reason: reason }],
-              }));
+              controller.enqueue(
+                sseData({
+                  id: "cmpl-stop",
+                  object: "chat.completion.chunk",
+                  choices: [{ index: 0, delta: {}, finish_reason: reason }],
+                })
+              );
               controller.enqueue(sseDone());
             };
 
@@ -296,7 +314,6 @@ export default {
                         const obj: any = JSON.parse(dataStr);
                         const type = obj?.type || lastEvent || obj?.event || "";
 
-                        // 文本增量
                         if (
                           type.endsWith(".delta") ||
                           type === "response.delta" ||
@@ -311,7 +328,6 @@ export default {
                           continue;
                         }
 
-                        // 完成
                         if (
                           type.endsWith(".done") ||
                           type === "response.completed" ||
@@ -323,9 +339,8 @@ export default {
                           break;
                         }
 
-                        // 其他事件（工具调用/检索中/思考等）交由服务端处理；我们等待最终文本
                       } catch {
-                        // 非 JSON data（如心跳）忽略
+                        // ignore parse errors
                       }
                     }
                   }
