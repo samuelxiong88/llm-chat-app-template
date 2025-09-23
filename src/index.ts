@@ -1,7 +1,7 @@
 /**
- * Worker → OpenAI Responses API with *native* tools (server-side) + SSE
- * - 前端无需改；模型若有权限，会像网页版一样自动调用工具（web/retrieval/code等）
- * - 若工具不被支持/未开通，自动移除 tools 回退，不影响正常回答
+ * Worker → OpenAI Responses API with native tools + SSE
+ * - 前端无需改；若你的组织开通了原生工具，模型会自动调用
+ * - 不支持时自动回退为无工具回答
  */
 
 const DEFAULT_API_BASE = "https://api.openai.com/v1";
@@ -166,29 +166,23 @@ export default {
           basePayload.temperature = temperature;
           basePayload.top_p = top_p;
         } else {
-          // thinking 模型才允许 reasoning
-          basePayload.reasoning = { effort: "medium" };
+          basePayload.reasoning = { effort: "medium" }; // thinking only
         }
 
-        // 原生 tools（交给 OpenAI 服务端编排）
-        // - 若你的组织已开通，会启用；否则会报 unsupported 参数，我们自动回退
+        // 原生工具（交给 OpenAI 服务端编排）。若关闭或未开通，将在下方自动回退。
         if (enableNativeTools) {
-          // 最常见的通用工具集合（示例；具体名称以你账号开通的为准）
-          // 如果你的组织有“web / file_search / code_interpreter”等，服务端会自行编排。
           basePayload.tools = [
-            { type: "web" },            // 浏览/搜索（若开通）
-            { type: "file_search" },    // 检索你上传到 OpenAI 的文件（若开通）
-            { type: "code_interpreter"} // 代码/计算（若开通）
+            { type: "web_search_preview" }, // ← 你也可换为 "web_search_preview_2025_03_11"
+            { type: "file_search" },
+            { type: "code_interpreter" },
           ];
           basePayload.tool_choice = "auto";
         }
 
-        // call upstream with fallback
         const headers = {
           Authorization: `Bearer ${env.OPENAI_API_KEY}`,
           "Content-Type": "application/json",
           Accept: "text/event-stream",
-          // 一些租户需要 Beta 头；也可能需要 tools 相关 beta 头
           "OpenAI-Beta": env.OPENAI_BETA || "responses-2024-12-17",
         };
 
@@ -199,12 +193,12 @@ export default {
           body: JSON.stringify(payload),
         });
 
-        // 若 400 因 tools/reasoning/sampling 不被支持，自动去掉相关字段重试一次
+        // 若 400 因 tools/reasoning/sampling 不被支持，自动回退
         if (!upstream.ok) {
           const firstDetail = await upstream.text().catch(() => "");
-          const isToolUnsupported =
+          const isToolInvalidOrUnsupported =
             upstream.status === 400 &&
-            /Unsupported (parameter|tool)|unknown tool|tools? not supported/i.test(firstDetail);
+            /invalid_value.*tools\[.*\]\.type|Unsupported (parameter|tool)|unknown tool|tools? not supported/i.test(firstDetail);
           const badSampling =
             upstream.status === 400 &&
             /Unsupported parameter.*(temperature|top_p)/i.test(firstDetail);
@@ -212,8 +206,8 @@ export default {
             upstream.status === 400 &&
             /Unsupported parameter.*reasoning\.effort/i.test(firstDetail);
 
-          if (isToolUnsupported || badSampling || badReasoning) {
-            // 构造一个“最小通用”payload 回退
+          if (isToolInvalidOrUnsupported || badSampling || badReasoning) {
+            // 回退为最小通用 payload（无 tools、无不支持参数）
             payload = {
               model,
               input: messages,
@@ -329,8 +323,7 @@ export default {
                           break;
                         }
 
-                        // 其余事件（工具调用、思考、进度等）由服务端处理
-                        // 我们无需特殊处理，等待其最终文本增量即可
+                        // 其他事件（工具调用/检索中/思考等）交由服务端处理；我们等待最终文本
                       } catch {
                         // 非 JSON data（如心跳）忽略
                       }
