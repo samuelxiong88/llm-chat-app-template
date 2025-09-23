@@ -1,7 +1,8 @@
 /**
- * Worker → OpenAI Responses API with native tools + SSE
- * - 前端无需改；若你的组织开通了原生工具，模型会自动调用
- * - 不支持时自动回退为无工具回答
+ * Worker → OpenAI Responses API with native web search + SSE
+ * - 仅启用 web_search_preview（自动联网搜索）
+ * - 若工具/参数不被支持，自动回退为“无工具”回答
+ * - 前端无需改（SSE 以 chat-completions 风格 choices[0].delta.content 输出）
  */
 
 const DEFAULT_API_BASE = "https://api.openai.com/v1";
@@ -18,35 +19,21 @@ function json(obj: unknown, status = 200): Response {
     headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" },
   });
 }
-function sseData(o: unknown) {
-  return te.encode(`data: ${JSON.stringify(o)}\n\n`);
-}
-function sseDone() {
-  return te.encode(`data: [DONE]\n\n`);
-}
+function sseData(o: unknown) { return te.encode(`data: ${JSON.stringify(o)}\n\n`); }
+function sseDone() { return te.encode(`data: [DONE]\n\n`); }
 function sseErrorResponse(status: number, detail: string) {
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      controller.enqueue(
-        sseData({
-          id: "cmpl-error",
-          object: "chat.completion.chunk",
-          choices: [
-            {
-              index: 0,
-              delta: { content: `⚠️ Upstream error ${status}: ${String(detail).slice(0, 1000)}` },
-              finish_reason: null,
-            },
-          ],
-        })
-      );
-      controller.enqueue(
-        sseData({
-          id: "cmpl-stop",
-          object: "chat.completion.chunk",
-          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        })
-      );
+      controller.enqueue(sseData({
+        id: "cmpl-error",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: { content: `⚠️ Upstream error ${status}: ${String(detail).slice(0, 1000)}` }, finish_reason: null }],
+      }));
+      controller.enqueue(sseData({
+        id: "cmpl-stop",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      }));
       controller.enqueue(sseDone());
       controller.close();
     },
@@ -112,9 +99,7 @@ export default {
       // /api/ping
       if (url.pathname === "/api/ping") {
         try {
-          const r = await fetch(`${apiBase}/models`, {
-            headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
-          });
+          const r = await fetch(`${apiBase}/models`, { headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` } });
           const text = await r.text();
           return new Response(text, {
             status: r.status,
@@ -181,15 +166,12 @@ export default {
           basePayload.temperature = temperature;
           basePayload.top_p = top_p;
         } else {
-          basePayload.reasoning = { effort: "medium" }; // thinking only
+          basePayload.reasoning = { effort: "medium" }; // only for thinking models
         }
 
-        // 原生工具（交给 OpenAI 服务端编排）。若关闭或未开通，将在下方自动回退。
+        // 原生工具：仅 web_search_preview；若未开通/未启用，下面会自动回退
         if (enableNativeTools) {
-          basePayload.tools = [
-            { type: "web_search_preview" },   // 你也可改成 web_search_preview_2025_03_11
-            { type: "code_interpreter" }
-          ];
+          basePayload.tools = [{ type: "web_search_preview" }]; // 或换成 "web_search_preview_2025_03_11"
           basePayload.tool_choice = "auto";
         }
 
@@ -212,7 +194,7 @@ export default {
           const firstDetail = await upstream.text().catch(() => "");
           const isToolInvalidOrUnsupported =
             upstream.status === 400 &&
-            /invalid_value.*tools\[.*\]\.type|Unsupported (parameter|tool)|unknown tool|tools? not supported/i.test(firstDetail);
+            /invalid_value.*tools|\bUnsupported (parameter|tool)\b|unknown tool|tools? not supported/i.test(firstDetail);
           const badSampling =
             upstream.status === 400 &&
             /Unsupported parameter.*(temperature|top_p)/i.test(firstDetail);
@@ -245,16 +227,14 @@ export default {
 
         // passthrough Responses SSE → chat-completions 风格
         const readable = upstream.body;
-
         const out = new ReadableStream<Uint8Array>({
           start(controller) {
-            controller.enqueue(
-              sseData({
-                id: "cmpl-start",
-                object: "chat.completion.chunk",
-                choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
-              })
-            );
+            // 起始：role=assistant
+            controller.enqueue(sseData({
+              id: "cmpl-start",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+            }));
 
             const decoder = new TextDecoder("utf-8");
             let buffer = "";
@@ -263,22 +243,18 @@ export default {
 
             const pushDelta = (text: string) => {
               if (!text) return;
-              controller.enqueue(
-                sseData({
-                  id: "cmpl-chunk",
-                  object: "chat.completion.chunk",
-                  choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-                })
-              );
+              controller.enqueue(sseData({
+                id: "cmpl-chunk",
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+              }));
             };
             const pushStop = (reason = "stop") => {
-              controller.enqueue(
-                sseData({
-                  id: "cmpl-stop",
-                  object: "chat.completion.chunk",
-                  choices: [{ index: 0, delta: {}, finish_reason: reason }],
-                })
-              );
+              controller.enqueue(sseData({
+                id: "cmpl-stop",
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: {}, finish_reason: reason }],
+              }));
               controller.enqueue(sseDone());
             };
 
@@ -314,11 +290,8 @@ export default {
                         const obj: any = JSON.parse(dataStr);
                         const type = obj?.type || lastEvent || obj?.event || "";
 
-                        if (
-                          type.endsWith(".delta") ||
-                          type === "response.delta" ||
-                          typeof obj.delta === "string"
-                        ) {
+                        // 文本增量
+                        if (type.endsWith(".delta") || type === "response.delta" || typeof obj.delta === "string") {
                           const t =
                             typeof obj.delta === "string" ? obj.delta :
                             typeof obj.text === "string" ? obj.text :
@@ -328,19 +301,15 @@ export default {
                           continue;
                         }
 
-                        if (
-                          type.endsWith(".done") ||
-                          type === "response.completed" ||
-                          obj?.done === true ||
-                          obj?.status === "completed"
-                        ) {
+                        // 完成
+                        if (type.endsWith(".done") || type === "response.completed" || obj?.done === true || obj?.status === "completed") {
                           pushStop("stop");
                           closed = true;
                           break;
                         }
 
                       } catch {
-                        // ignore parse errors
+                        // 忽略非 JSON 行（心跳等）
                       }
                     }
                   }
