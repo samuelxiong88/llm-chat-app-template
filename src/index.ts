@@ -6,7 +6,7 @@
  */
 
 const DEFAULT_API_BASE = "https://api.openai.com/v1";
-const DEFAULT_MODEL = "gpt-5-chat-latest";
+const DEFAULT_MODEL = "gpt-4o";
 const DEFAULT_SYSTEM_PROMPT =
   "You are a senior bilingual (中英双语) analyst and writer. When the user asks for explanations, think step-by-step but keep the final answer concise, structured, and actionable. Prefer clear headings and short lists. Add quick checks or caveats when needed. If you are unsure, say so and state your assumptions. Use simple, precise wording; avoid purple prose. 默认用用户的语言回答；如果用户用中文，你用中文并保留必要的英文术语。";
 
