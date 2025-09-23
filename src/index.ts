@@ -7,17 +7,15 @@
  * - GET  /api/debug                  环境变量自检
  * - GET  /                           静态资源兜底（ASSETS 未绑定时返回说明页）
  *
- * 特性：
- * 1) 使用 /responses，兼容 gpt-5-thinking（不传 temperature/top_p）
- * 2) 将 Responses 的 SSE 事件适配为 chat-completions 的增量格式：
- *    {"choices":[{"delta":{"role":"assistant" | "content":"..."}, "index":0, "finish_reason":null}]}
- *    最后发 {"finish_reason":"stop"} 与 [DONE]
- * 3) 上游报错（4xx/5xx）也以 SSE 形式向前端输出详细原因
+ * 注意：
+ * - /responses 接口
+ * - gpt-5-thinking 不支持 temperature/top_p；gpt-5 / gpt-5-chat-latest 支持
  */
 
 import type { Env } from "./types";
 
 const DEFAULT_API_BASE = "https://api.openai.com/v1";
+const DEFAULT_MODEL = "gpt-5";
 
 // 兜底系统提示（可用 env.SYSTEM_PROMPT 覆盖）
 const DEFAULT_SYSTEM_PROMPT =
@@ -89,7 +87,7 @@ export default {
     try {
       const url = new URL(request.url);
       const apiBase = env.OPENAI_API_BASE || DEFAULT_API_BASE;
-      const model = env.OPENAI_MODEL || "gpt-5"; // 默认对齐 gpt-5-thinking
+      const model = (env.OPENAI_MODEL || DEFAULT_MODEL).trim();
       const SYSTEM_PROMPT = env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT;
 
       // ==== 静态资源（兜底）====
@@ -184,12 +182,13 @@ export default {
           return json({ error: "Method not allowed" }, 405);
         }
 
-        // 2) 参数：gpt-5-thinking 不支持 temperature/top_p
-        //    兼容 max_tokens / max_output_tokens 的 query 名
+        // 2) 公共参数（兼容 max_tokens / max_output_tokens 的 query 名）
         const queryMax =
           url.searchParams.get("max_tokens") ??
           url.searchParams.get("max_output_tokens");
         const querySeed = url.searchParams.get("seed");
+        const queryT = url.searchParams.get("temperature");
+        const queryTP = url.searchParams.get("top_p");
 
         const max_output_tokens =
           queryMax !== null
@@ -199,11 +198,29 @@ export default {
             : 1024;
 
         const seed =
-          querySeed !== null
-            ? Number(querySeed)
-            : env.OPENAI_SEED
-            ? Number(env.OPENAI_SEED as any)
-            : undefined;
+            querySeed !== null
+              ? Number(querySeed)
+              : env.OPENAI_SEED
+              ? Number(env.OPENAI_SEED as any)
+              : undefined;
+
+        // 只有 chat/通用模型才支持 temperature/top_p；thinking 不支持
+        const supportsSampling =
+          !/thinking/i.test(model); // 简单判断：包含 "thinking" 则不支持
+
+        const temperature =
+          queryT !== null
+            ? Number(queryT)
+            : env.OPENAI_TEMPERATURE
+            ? Number(env.OPENAI_TEMPERATURE as any)
+            : 0.7;
+
+        const top_p =
+          queryTP !== null
+            ? Number(queryTP)
+            : env.OPENAI_TOP_P
+            ? Number(env.OPENAI_TOP_P as any)
+            : 1.0;
 
         // 3) 组织 Responses API payload（仅传支持的字段）
         const payload: Record<string, unknown> = {
@@ -211,12 +228,14 @@ export default {
           input: messages, // Responses API 支持 role/content 数组
           stream: true,
           max_output_tokens,
-          temperature,
-          top_p,
           reasoning: { effort: "medium" }, // 可调 small/medium/large
         };
         if (seed !== undefined && !Number.isNaN(seed)) {
-          (payload as any).seed = seed;
+          payload.seed = seed;
+        }
+        if (supportsSampling) {
+          payload.temperature = temperature;
+          payload.top_p = top_p;
         }
 
         // 4) 请求 Responses（SSE）
