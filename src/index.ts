@@ -15,7 +15,7 @@
 import type { Env } from "./types";
 
 const DEFAULT_API_BASE = "https://api.openai.com/v1";
-const DEFAULT_MODEL = "gpt-5";
+const DEFAULT_MODEL = "gpt-5-chat-latest";
 
 // 兜底系统提示（可用 env.SYSTEM_PROMPT 覆盖）
 const DEFAULT_SYSTEM_PROMPT =
