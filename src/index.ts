@@ -1,18 +1,17 @@
 /**
- * Minimal passthrough: Cloudflare Worker → OpenAI Chat Completions (SSE)
- * Endpoints:
- *   GET  /api/chat?q=hello        // 调试/EventSource 兼容
- *   POST /api/chat {messages:[...]}// 标准调用（推荐，带完整历史）
- *   GET  /api/ping                // 连通性自检
- *   GET  /api/debug               // 变量自检
- *   GET  /                        // 简单兜底页（ASSETS 未绑定时）
+ * Passthrough (Cloudflare Worker) → OpenAI Responses API (SSE)
+ * - GET  /api/chat?q=hello        // 简单调试（单轮）
+ * - POST /api/chat {messages:[...]} // 标准（带完整历史）
+ * - GET  /api/ping
+ * - GET  /api/debug
+ * - GET  /                        // 兜底页（未绑定 ASSETS 时）
  */
 
 import type { Env } from "./types";
 
 const DEFAULT_API_BASE = "https://api.openai.com/v1";
 
-// 兜底系统提示（真正使用时会在 fetch 中用 env.SYSTEM_PROMPT 覆盖）
+// 兜底系统提示（可用 env.SYSTEM_PROMPT 覆盖）
 const DEFAULT_SYSTEM_PROMPT =
   "You are a senior bilingual (中英双语) analyst and writer. When the user asks for explanations, think step-by-step but keep the final answer concise, structured, and actionable. Prefer clear headings and short lists. Add quick checks or caveats when needed. If you are unsure, say so and state your assumptions. Use simple, precise wording; avoid purple prose. 默认用用户的语言回答；如果用户用中文，你用中文并保留必要的英文术语。";
 
@@ -24,6 +23,19 @@ function json(obj: unknown, status = 200) {
       "Access-Control-Allow-Origin": "*",
     },
   });
+}
+
+// --- 简易 SSE 编码 ---
+const te = new TextEncoder();
+function sseLine(data: string) {
+  // data 已经是 “data: ...\n\n” 结构的主体；这里只做统一编码
+  return te.encode(data);
+}
+function sseData(payload: unknown) {
+  return sseLine(`data: ${JSON.stringify(payload)}\n\n`);
+}
+function sseDone() {
+  return sseLine(`data: [DONE]\n\n`);
 }
 
 export default {
@@ -99,11 +111,9 @@ export default {
 
       // ==== /api/chat ====
       if (url.pathname === "/api/chat") {
-        // 1) 组装 messages（GET 用 q，POST 用 body）
-        let messages: Array<{
-          role: "system" | "user" | "assistant";
-          content: string;
-        }>;
+        // 1) 组装 messages（GET 单轮；POST 带历史）
+        type Msg = { role: "system" | "user" | "assistant"; content: string };
+        let messages: Msg[];
 
         if (request.method === "GET") {
           const q = url.searchParams.get("q") || "Hello";
@@ -128,10 +138,10 @@ export default {
           return json({ error: "Method not allowed" }, 405);
         }
 
-        // 2) 采样/长度参数（可由 URL 或 Env 覆盖）
+        // 2) 采样/长度（Responses API 字段名稍有不同）
         const queryT = url.searchParams.get("temperature");
         const queryTP = url.searchParams.get("top_p");
-        const queryMax = url.searchParams.get("max_tokens");
+        const queryMax = url.searchParams.get("max_tokens") ?? url.searchParams.get("max_output_tokens");
         const querySeed = url.searchParams.get("seed");
 
         const temperature =
@@ -148,7 +158,7 @@ export default {
             ? Number(env.OPENAI_TOP_P as any)
             : 1.0;
 
-        const max_tokens =
+        const max_output_tokens =
           queryMax !== null
             ? Number(queryMax)
             : env.OPENAI_MAX_TOKENS
@@ -162,29 +172,33 @@ export default {
             ? Number(env.OPENAI_SEED as any)
             : undefined;
 
+        // 3) 组织 Responses API payload
         const payload: Record<string, unknown> = {
           model,
-          messages,
+          input: messages, // Responses API 接受 role/content 结构
           stream: true,
           temperature,
           top_p,
-          max_tokens,
+          max_output_tokens,
+          reasoning: { effort: "medium" }, // 可按需调 small/medium/large
         };
         if (seed !== undefined && !Number.isNaN(seed)) {
           (payload as any).seed = seed;
         }
 
-        // 3) 调 OpenAI
-        const upstream = await fetch(`${apiBase}/chat/completions`, {
+        // 4) 请求 Responses API（SSE）
+        const upstream = await fetch(`${apiBase}/responses`, {
           method: "POST",
           headers: {
             Authorization: `Bearer ${env.OPENAI_API_KEY}`,
             "Content-Type": "application/json",
+            // 一般不需要额外 Beta 头；若你的账号要求，可在此加：
+            // "OpenAI-Beta": "responses-2024-12-17",
+            Accept: "text/event-stream",
           },
           body: JSON.stringify(payload),
         });
 
-        // 4) 失败时返回 JSON，便于定位
         if (!upstream.ok || !upstream.body) {
           const detail = await upstream.text().catch(() => "");
           return json(
@@ -197,8 +211,155 @@ export default {
           );
         }
 
-        // 5) 直通 OpenAI 原始 SSE
-        return new Response(upstream.body, {
+        // 5) 适配 SSE：把 Responses 流转换成 chat-completions 风格
+        //    - 前端仍然按 choices[0].delta.content 增量解析
+        const readable = upstream.body;
+
+        const out = new ReadableStream<Uint8Array>({
+          start(controller) {
+            // 先发一条带 role 的增量（很多前端忽略它，也没关系）
+            controller.enqueue(
+              sseData({
+                id: "cmpl-start",
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+              })
+            );
+
+            const decoder = new TextDecoder("utf-8");
+            let buffer = "";
+            let closed = false;
+            let lastEvent = ""; // 记录 upstream 的 event 名称（有些实现会有 event: xxx）
+
+            const pushDelta = (text: string) => {
+              if (!text) return;
+              controller.enqueue(
+                sseData({
+                  id: "cmpl-chunk",
+                  object: "chat.completion.chunk",
+                  choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+                })
+              );
+            };
+
+            const pushStop = (reason: string = "stop") => {
+              controller.enqueue(
+                sseData({
+                  id: "cmpl-stop",
+                  object: "chat.completion.chunk",
+                  choices: [{ index: 0, delta: {}, finish_reason: reason }],
+                })
+              );
+              controller.enqueue(sseDone());
+            };
+
+            const reader = readable.getReader();
+
+            const pump = async () => {
+              try {
+                while (true) {
+                  const { value, done } = await reader.read();
+                  if (done) break;
+                  buffer += decoder.decode(value, { stream: true });
+
+                  // 按行拆分
+                  const lines = buffer.split("\n");
+                  buffer = lines.pop() || "";
+
+                  for (const raw of lines) {
+                    const line = raw.trim();
+                    if (!line) continue;
+
+                    // 处理 Responses API 的 SSE 结构
+                    if (line.startsWith("event:")) {
+                      lastEvent = line.slice(6).trim();
+                      continue;
+                    }
+                    if (line.startsWith("data:")) {
+                      const dataStr = line.slice(5).trim();
+
+                      // 个别实现可能用 [DONE]
+                      if (dataStr === "[DONE]") {
+                        pushStop("stop");
+                        closed = true;
+                        break;
+                      }
+
+                      // 解析 JSON
+                      try {
+                        const obj: any = JSON.parse(dataStr);
+
+                        // 适配几种常见字段（尽量健壮）：
+                        // 1) Responses API 常见：event: response.output_text.delta => { delta: "..." }
+                        // 2) 或 { type: "response.output_text.delta", delta: "..." }
+                        // 3) 某些实现：{ text: "..." } 或 { content: "..." }
+                        // 4) 可能存在 { type: "response.completed" } / { event: "...done" }
+                        const type =
+                          obj?.type ||
+                          lastEvent ||
+                          obj?.event ||
+                          "";
+
+                        if (
+                          type.endsWith(".delta") ||
+                          type === "response.delta" ||
+                          typeof obj.delta === "string"
+                        ) {
+                          const t =
+                            typeof obj.delta === "string"
+                              ? obj.delta
+                              : typeof obj.text === "string"
+                              ? obj.text
+                              : typeof obj.content === "string"
+                              ? obj.content
+                              : typeof obj?.output_text?.content?.[0]?.text === "string"
+                              ? obj.output_text.content[0].text
+                              : "";
+                          if (t) pushDelta(t);
+                          continue;
+                        }
+
+                        if (
+                          type.endsWith(".done") ||
+                          type === "response.completed" ||
+                          obj?.done === true ||
+                          obj?.status === "completed"
+                        ) {
+                          pushStop("stop");
+                          closed = true;
+                          break;
+                        }
+
+                        // 某些模型还会发思考/工具事件，可以忽略或自定义处理
+                        // 如果 obj 里有直接可用的文本也推一下
+                        if (typeof obj.text === "string") {
+                          pushDelta(obj.text);
+                        } else if (typeof obj.content === "string") {
+                          pushDelta(obj.content);
+                        }
+                      } catch {
+                        // data 不是 JSON —— 忽略
+                      }
+                    }
+                  }
+
+                  if (closed) break;
+                }
+              } catch (err) {
+                // 读取中断/网络错误
+              } finally {
+                if (!closed) {
+                  pushStop("stop");
+                }
+                controller.close();
+              }
+            };
+
+            pump();
+          },
+        });
+
+        return new Response(out, {
           headers: {
             "Content-Type": "text/event-stream; charset=utf-8",
             "Cache-Control": "no-cache",
@@ -211,7 +372,6 @@ export default {
 
       return json({ error: "Not found" }, 404);
     } catch (e) {
-      // 避免 1101，统一返回 JSON
       return json({ error: "Worker exception", detail: String(e) }, 500);
     }
   },
