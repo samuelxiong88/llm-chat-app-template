@@ -2,7 +2,8 @@
  * Worker → OpenAI Responses API (SSE)
  * - 先返回 SSE 头，再在流内异步拉 OpenAI，避免浏览器等不到响应头
  * - 工具白名单 + 自动回退（web_search_preview_2025_03_11）
- * - 工具事件只提示一次；8s 心跳；45s 总超时；12s 首包回退为非流式
+ * - 精准支持 response.web_search_call.* 事件：只提示一次，显示条数与完成状态
+ * - 8s 心跳；45s 总超时；12s 首包回退为非流式
  * - DEBUG_DUMP=on: 输出前 5 条 RAW data 行用于排错
  * - SSE 转成 chat-completions 风格 choices[0].delta.content
  */
@@ -35,24 +36,6 @@ function json(obj: unknown, status = 200): Response {
 }
 function sseData(o: unknown) { return te.encode(`data: ${JSON.stringify(o)}\n\n`); }
 function sseDone() { return te.encode(`data: [DONE]\n\n`); }
-function sseErrorStream(detail: string) {
-  return new ReadableStream<Uint8Array>({
-    start(controller) {
-      controller.enqueue(sseData({
-        id: "cmpl-error",
-        object: "chat.completion.chunk",
-        choices: [{ index: 0, delta: { content: detail }, finish_reason: null }],
-      }));
-      controller.enqueue(sseData({
-        id: "cmpl-stop",
-        object: "chat.completion.chunk",
-        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-      }));
-      controller.enqueue(sseDone());
-      controller.close();
-    },
-  });
-}
 
 export default {
   async fetch(request: Request, env: any): Promise<Response> {
@@ -75,31 +58,9 @@ export default {
         "gpt-4.1-mini",
       ]);
 
-      // 兜底/静态
+      // 根路径 → 兜底页
       if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
-        const html = `<!doctype html><meta charset="utf-8"><title>LLM Chat</title>
-<body style="font-family:system-ui;margin:40px">
-<h2>LLM Chat App</h2>
-<ul>
-  <li><code>/api/ping</code></li>
-  <li><code>/api/chat?q=hello</code></li>
-  <li><code>/api/debug</code></li>
-  <li><code>/api/health</code></li>
-</ul>
-</body>`;
-        return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
-      }
-
-      // CORS 预检
-      if (request.method === "OPTIONS") {
-        return new Response(null, {
-          headers: {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "content-type, authorization",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Max-Age": "86400",
-          },
-        });
+        return new Response("<h2>LLM Chat Worker</h2>", { headers: { "content-type": "text/html" } });
       }
 
       // /api/debug
@@ -113,53 +74,9 @@ export default {
         });
       }
 
-      // /api/health（非流式 ping）
-      if (url.pathname === "/api/health") {
-        const payload = {
-          model,
-          input: [
-            { role: "system", content: "Reply with 'OK' only." },
-            { role: "user", content: "ping" },
-          ],
-          stream: false,
-          max_output_tokens: 16,
-        };
-        const r = await fetch(`${apiBase}/responses`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-            "Content-Type": "application/json",
-            Accept: "application/json",
-            "OpenAI-Beta": env.OPENAI_BETA || "responses-2024-12-17",
-          },
-          body: JSON.stringify(payload),
-        });
-        const t = await r.text().catch(() => "");
-        return new Response(t || "no-body", {
-          status: r.status,
-          headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" },
-        });
-      }
-
-      // /api/ping
-      if (url.pathname === "/api/ping") {
-        try {
-          const r = await fetch(`${apiBase}/models`, {
-            headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
-          });
-          const text = await r.text();
-          return new Response(text, {
-            status: r.status,
-            headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" },
-          });
-        } catch (e) {
-          return json({ error: String(e) }, 500);
-        }
-      }
-
       // /api/chat
       if (url.pathname === "/api/chat") {
-        // 1) 组装 messages
+        // 组装 messages
         type Msg = { role: "system" | "user" | "assistant"; content: string };
         let messages: Msg[] = [];
         if (request.method === "GET") {
@@ -176,50 +93,21 @@ export default {
           return json({ error: "Method not allowed" }, 405);
         }
 
-        // 2) 参数
-        const qMax = url.searchParams.get("max_tokens") ?? url.searchParams.get("max_output_tokens");
-        const qSeed = url.searchParams.get("seed");
-        const qT = url.searchParams.get("temperature");
-        const qTP = url.searchParams.get("top_p");
-
-        const isThinking = /thinking/i.test(model);
-        const supportsSampling = !isThinking;
-
-        const max_output_tokens =
-          qMax !== null ? Number(qMax) : env.OPENAI_MAX_TOKENS ? Number(env.OPENAI_MAX_TOKENS) : 1024;
-
-        const seed =
-          qSeed !== null ? Number(qSeed) : env.OPENAI_SEED ? Number(env.OPENAI_SEED) : undefined;
-
-        const temperature =
-          qT !== null ? Number(qT) : env.OPENAI_TEMPERATURE ? Number(env.OPENAI_TEMPERATURE) : 0.7;
-
-        const top_p =
-          qTP !== null ? Number(qTP) : env.OPENAI_TOP_P ? Number(env.OPENAI_TOP_P) : 1.0;
-
-        // 3) 基本 payload（此处不请求上游）
+        // payload
         const basePayload: any = {
           model,
           input: messages,
           stream: true,
-          max_output_tokens,
+          max_output_tokens: 1200,
         };
-        if (seed !== undefined && !Number.isNaN(seed)) basePayload.seed = seed;
-        if (supportsSampling) {
-          basePayload.temperature = temperature;
-          basePayload.top_p = top_p;
-        } else {
-          basePayload.reasoning = { effort: "medium" };
-        }
         if (ENABLE_TOOLS && TOOL_MODELS.has(model)) {
           basePayload.tools = [{ type: "web_search_preview_2025_03_11" }];
           basePayload.tool_choice = "auto";
         }
 
-        // 4) 立即返回 SSE，并在流内异步拉 OpenAI
+        // SSE
         const stream = new ReadableStream<Uint8Array>({
           start(controller) {
-            // 起始：只发 role（前端自有占位会覆盖）
             controller.enqueue(sseData({
               id: "cmpl-start",
               object: "chat.completion.chunk",
@@ -227,15 +115,11 @@ export default {
             }));
 
             (async () => {
-              // 总超时 & 心跳
               const upstreamCtl = new AbortController();
-              const REQUEST_TIMEOUT_MS = 45000;
-              const timeoutHandle = setTimeout(() => upstreamCtl.abort("request-timeout"), REQUEST_TIMEOUT_MS);
-
+              const timeoutHandle = setTimeout(() => upstreamCtl.abort("request-timeout"), 45000);
               let lastTextTs = Date.now();
-              const HEARTBEAT_MS = 8000;
               const heartbeat = setInterval(() => {
-                if (Date.now() - lastTextTs > HEARTBEAT_MS) {
+                if (Date.now() - lastTextTs > 8000) {
                   controller.enqueue(sseData({
                     id: "cmpl-chunk",
                     object: "chat.completion.chunk",
@@ -243,10 +127,10 @@ export default {
                   }));
                   lastTextTs = Date.now();
                 }
-              }, HEARTBEAT_MS);
+              }, 8000);
 
-              let gotFirstText = false;           // 是否已收到正文
-              let toolInProgressShown = false;    // 避免“正在检索”刷屏
+              let gotFirstText = false;
+              let toolInProgressShown = false;
 
               const pushDelta = (text: string) => {
                 if (!text) return;
@@ -258,11 +142,11 @@ export default {
                   choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
                 }));
               };
-              const pushStop = (reason = "stop") => {
+              const pushStop = () => {
                 controller.enqueue(sseData({
                   id: "cmpl-stop",
                   object: "chat.completion.chunk",
-                  choices: [{ index: 0, delta: {}, finish_reason: reason }],
+                  choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
                 }));
                 controller.enqueue(sseDone());
               };
@@ -271,27 +155,22 @@ export default {
                 const reader = readable.getReader();
                 const decoder = new TextDecoder("utf-8");
                 let buffer = "";
-                let closed = false;
                 let lastEvent = "";
                 let dumpCount = 0;
-
                 while (true) {
                   const { value, done } = await reader.read();
                   if (done) break;
                   buffer += decoder.decode(value, { stream: true });
-
                   const lines = buffer.split("\n");
                   buffer = lines.pop() || "";
-
                   for (const raw of lines) {
                     const line = raw.trim();
                     if (!line) continue;
-
                     if (line.startsWith("event:")) { lastEvent = line.slice(6).trim(); continue; }
                     if (!line.startsWith("data:")) continue;
                     const dataStr = line.slice(5).trim();
 
-                    // RAW dump（前 5 条）
+                    // RAW dump
                     if (DEBUG_DUMP && dumpCount < 5 && dataStr !== "[DONE]") {
                       dumpCount++;
                       controller.enqueue(sseData({
@@ -301,7 +180,7 @@ export default {
                       }));
                     }
 
-                    if (dataStr === "[DONE]") { pushStop("stop"); closed = true; break; }
+                    if (dataStr === "[DONE]") { pushStop(); return; }
 
                     try {
                       const obj: any = JSON.parse(dataStr);
@@ -312,47 +191,39 @@ export default {
                       if (type.endsWith(".delta") || type === "response.delta" || typeof obj.delta === "string") {
                         const t =
                           typeof obj.delta === "string" ? obj.delta :
-                          typeof obj.text === "string"  ? obj.text  :
+                          typeof obj.text === "string" ? obj.text :
                           typeof obj.content === "string" ? obj.content :
                           (obj?.output_text?.content?.[0]?.text || "");
                         if (t) pushDelta(t);
                         continue;
                       }
 
-                      // 工具事件提示（只提示一次）
-                      const isToolStart =
-                        /(tool_call|tool)\.(started|created)/i.test(tLower) ||
-                        /web_search/.test(JSON.stringify(obj || {}));
-                      if (isToolStart && !toolInProgressShown) {
-                        pushDelta("🔎 正在联网检索…");
-                        toolInProgressShown = true;
-                        continue;
-                      }
-                      const isToolDone = /(tool_call|tool)\.(completed|finish|finished)/i.test(tLower);
-                      if (isToolDone) {
-                        pushDelta("📄 已获取结果，正在整合…");
-                        continue;
+                      // === Responses web_search_call.* 精准提示 ===
+                      if (type.startsWith("response.web_search_call")) {
+                        if (/in_progress|searching|started|created/i.test(tLower) && !toolInProgressShown) {
+                          pushDelta("🔎 正在联网检索…");
+                          toolInProgressShown = true;
+                          continue;
+                        }
+                        if (/results$/i.test(tLower) && Array.isArray(obj?.results)) {
+                          pushDelta(`🧭 已获取 ${obj.results.length} 条线索，正在整合…`);
+                          continue;
+                        }
+                        if (/completed$/i.test(tLower)) {
+                          pushDelta("📄 已获取结果，正在整合…");
+                          continue;
+                        }
                       }
 
                       // 完成
-                      if (
-                        type.endsWith(".done") ||
-                        type === "response.completed" ||
-                        obj?.done === true ||
-                        obj?.status === "completed"
-                      ) {
-                        pushStop("stop");
-                        closed = true;
-                        break;
+                      if (type.endsWith(".done") || type === "response.completed" || obj?.done === true) {
+                        pushStop(); return;
                       }
 
-                      // 未知事件可见化（调试/兜底）
-                      if (DEBUG_EVENTS && type) {
-                        pushDelta(`（事件：${type}）`);
-                      }
-                    } catch { /* 非 JSON 行忽略 */ }
+                      // 未知事件可见化
+                      if (DEBUG_EVENTS && type) pushDelta(`（事件：${type}）`);
+                    } catch { /* 非 JSON */ }
                   }
-                  if (closed) break;
                 }
               }
 
@@ -361,149 +232,22 @@ export default {
                   Authorization: `Bearer ${env.OPENAI_API_KEY}`,
                   "Content-Type": "application/json",
                   Accept: "text/event-stream",
-                  "OpenAI-Beta":
-                    (env.OPENAI_BETA ? String(env.OPENAI_BETA) : "responses-2024-12-17") + "; tools=v1",
+                  "OpenAI-Beta": (env.OPENAI_BETA || "responses-2024-12-17") + "; tools=v1",
                 };
-
-                // 第一次（可能带工具）
-                let payload = basePayload;
-                let upstream = await fetch(`${apiBase}/responses`, {
-                  method: "POST",
-                  headers,
-                  body: JSON.stringify(payload),
-                  signal: upstreamCtl.signal,
+                const upstream = await fetch(`${apiBase}/responses`, {
+                  method: "POST", headers, body: JSON.stringify(basePayload), signal: upstreamCtl.signal,
                 });
-
-                // 400 → 自动回退（tools/参数不被支持）
-                if (!upstream.ok) {
-                  const firstDetail = await upstream.text().catch(() => "");
-                  const lower = firstDetail.toLowerCase();
-                  const toolsProblem =
-                    upstream.status === 400 && (
-                      (/invalid_value/.test(lower) && /tools/.test(lower)) ||
-                      (/not supported with/.test(lower) && /tool/.test(lower)) ||
-                      (/unsupported/.test(lower) && /tool/.test(lower)) ||
-                      /unknown tool/.test(lower) ||
-                      (/param/.test(lower) && /tools/.test(lower))
-                    );
-                  const badSampling =
-                    upstream.status === 400 && /unsupported/.test(lower) && /(temperature|top_p)/i.test(lower);
-                  const badReasoning =
-                    upstream.status === 400 && /unsupported/.test(lower) && /reasoning\.effort/i.test(lower);
-
-                  if (toolsProblem || badSampling || badReasoning) {
-                    payload = { model, input: messages, stream: true, max_output_tokens };
-                    if (typeof seed === "number" && !Number.isNaN(seed)) (payload as any).seed = seed;
-                    upstream = await fetch(`${apiBase}/responses`, {
-                      method: "POST",
-                      headers,
-                      body: JSON.stringify(payload),
-                      signal: upstreamCtl.signal,
-                    });
-                  } else {
-                    controller.enqueue(sseData({
-                      id: "cmpl-error",
-                      object: "chat.completion.chunk",
-                      choices: [{ index: 0, delta: { content: `⚠️ Upstream ${upstream.status}: ${firstDetail.slice(0, 800)}` }, finish_reason: null }],
-                    }));
-                    pushStop("stop");
-                    clearInterval(heartbeat); clearTimeout(timeoutHandle);
-                    controller.close();
-                    return;
-                  }
-                }
-
                 if (!upstream.ok || !upstream.body) {
                   const detail = await upstream.text().catch(() => "");
-                  controller.enqueue(sseData({
-                    id: "cmpl-error",
-                    object: "chat.completion.chunk",
-                    choices: [{ index: 0, delta: { content: `⚠️ Upstream error: ${detail.slice(0, 800)}` }, finish_reason: null }],
-                  }));
-                  pushStop("stop");
-                  clearInterval(heartbeat); clearTimeout(timeoutHandle);
-                  controller.close();
-                  return;
+                  pushDelta(`⚠️ Upstream error: ${detail.slice(0, 800)}`);
+                  pushStop(); controller.close(); return;
                 }
-
-                // 首包看门狗：12s 内未收到正文 → 非流式回退
-                const FIRST_PACKET_MS = 12000;
-                const firstPacketTimer = setTimeout(async () => {
-                  if (gotFirstText) return;
-                  try { upstreamCtl.abort(); } catch {}
-
-                  const fb: any = { model, input: messages, stream: false, max_output_tokens };
-                  if (typeof seed === "number" && !Number.isNaN(seed)) fb.seed = seed;
-
-                  const r = await fetch(`${apiBase}/responses`, {
-                    method: "POST",
-                    headers: {
-                      ...headers,
-                      Accept: "application/json",
-                      "OpenAI-Beta": env.OPENAI_BETA || "responses-2024-12-17",
-                    },
-                    body: JSON.stringify(fb),
-                  });
-
-                  const txt = await r.text().catch(() => "");
-                  if (!r.ok || !txt) {
-                    controller.enqueue(sseData({
-                      id: "cmpl-error",
-                      object: "chat.completion.chunk",
-                      choices: [{ index: 0, delta: { content: `（非流式回退失败）${txt.slice(0, 600)}` }, finish_reason: null }],
-                    }));
-                    pushStop("stop");
-                    clearInterval(heartbeat); clearTimeout(timeoutHandle);
-                    controller.close();
-                    return;
-                  }
-
-                  let out = "";
-                  try {
-                    const j = JSON.parse(txt);
-                    out =
-                      j?.output_text?.[0]?.content?.[0]?.text ||
-                      j?.output?.[0]?.content?.[0]?.text ||
-                      j?.choices?.[0]?.message?.content ||
-                      "";
-                  } catch {}
-                  if (!out) out = txt.slice(0, 2000);
-
-                  controller.enqueue(sseData({
-                    id: "cmpl-chunk",
-                    object: "chat.completion.chunk",
-                    choices: [{ index: 0, delta: { content: out }, finish_reason: null }],
-                  }));
-                  pushStop("stop");
-                  clearInterval(heartbeat); clearTimeout(timeoutHandle);
-                  controller.close();
-                }, FIRST_PACKET_MS);
-
-                // 读取首次上游流
                 await readUpstream(upstream.body);
-                clearTimeout(firstPacketTimer);
-
+              } catch (e) {
+                pushDelta(`⚠️ Worker error: ${String(e).slice(0, 200)}`);
+                pushStop(); controller.close();
+              } finally {
                 clearInterval(heartbeat); clearTimeout(timeoutHandle);
-                if (!gotFirstText) pushStop("stop");
-                controller.close();
-              } catch (e: any) {
-                clearInterval(heartbeat);
-                if (e?.name === "AbortError" || String(e).includes("request-timeout")) {
-                  controller.enqueue(sseData({
-                    id: "cmpl-error",
-                    object: "chat.completion.chunk",
-                    choices: [{ index: 0, delta: { content: "⌛ 后端连接超时（可能在调起联网检索或网络受限）。" }, finish_reason: null }],
-                  }));
-                  pushStop("stop");
-                  controller.close();
-                  return;
-                }
-                controller.enqueue(sseData({
-                  id: "cmpl-error",
-                  object: "chat.completion.chunk",
-                  choices: [{ index: 0, delta: { content: `⚠️ Worker error: ${String(e).slice(0, 800)}` }, finish_reason: null }],
-                }));
-                pushStop("stop");
                 controller.close();
               }
             })();
