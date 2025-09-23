@@ -12,11 +12,8 @@ import type { Env } from "./types";
 
 const DEFAULT_API_BASE = "https://api.openai.com/v1";
 const SYSTEM_PROMPT =
-  "You are a senior bilingual (中英双语) analyst and writer.
-When the user asks for explanations, think step-by-step but keep the final answer concise, structured, and actionable.
-Prefer clear headings and short lists. Add quick checks or caveats when needed.
-If you are unsure, say so and state your assumptions.
-Use simple, precise wording; avoid purple prose.默认用用户的语言回答；如果用户用中文，你用中文并保留必要的英文术语。";
+   env.SYSTEM_PROMPT ||
+"You are a senior bilingual (中英双语) analyst and writer. When the user asks for explanations, think step-by-step but keep the final answer concise, structured, and actionable. Prefer clear headings and short lists. Add quick checks or caveats when needed. If you are unsure, say so and state your assumptions. Use simple, precise wording; avoid purple prose. 默认用用户的语言回答；如果用户用中文，你用中文并保留必要的英文术语。";
 
 function json(obj: unknown, status = 200) {
   return new Response(JSON.stringify(obj), {
@@ -118,17 +115,31 @@ export default {
         }
 
         // 2) 调 OpenAI（不传 temperature，避免 gpt-5* 报错）
-        const upstream = await fetch(`${apiBase}/chat/completions`, {
+        const queryT = url.searchParams.get("temperature");
+ const queryTP = url.searchParams.get("top_p");
+ const queryMax = url.searchParams.get("max_tokens");
+ const querySeed = url.searchParams.get("seed");
+
+ const temperature = queryT !== null ? Number(queryT) : (env.OPENAI_TEMPERATURE ? Number(env.OPENAI_TEMPERATURE) : 0.7);
+ const top_p = queryTP !== null ? Number(queryTP) : (env.OPENAI_TOP_P ? Number(env.OPENAI_TOP_P) : 1.0);
+ const max_tokens = queryMax !== null ? Number(queryMax) : (env.OPENAI_MAX_TOKENS ? Number(env.OPENAI_MAX_TOKENS) : 1024);
+ const seed = querySeed !== null ? Number(querySeed) : (env.OPENAI_SEED ? Number(env.OPENAI_SEED) : undefined);
+
+ const payload: any = {
+   model,
+   messages,
+   stream: true,
+   temperature,
+   top_p,
+   max_tokens,
+ };
+ if (seed !== undefined && !Number.isNaN(seed)) payload.seed = seed;
           method: "POST",
           headers: {
             "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({
-            model,
-            messages,
-            stream: true,     // 关键：开启流式
-          }),
+          body: JSON.stringify(payload),
         });
 
         // 3) 失败时返回 JSON，便于定位
