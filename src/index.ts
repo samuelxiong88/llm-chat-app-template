@@ -211,6 +211,8 @@ export default {
           input: messages, // Responses API 支持 role/content 数组
           stream: true,
           max_output_tokens,
+          temperature,
+          top_p,
           reasoning: { effort: "medium" }, // 可调 small/medium/large
         };
         if (seed !== undefined && !Number.isNaN(seed)) {
