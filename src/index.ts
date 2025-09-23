@@ -127,10 +127,13 @@ export default {
 
       // ==== /api/debug ====
       if (url.pathname === "/api/debug") {
+        // 为了排错直观，加上 effective_model
+        const effective_model = (env.OPENAI_MODEL || DEFAULT_MODEL).trim();
         return json({
           OPENAI_API_KEY: env.OPENAI_API_KEY ? "set" : "not set",
           OPENAI_MODEL: env.OPENAI_MODEL || "not set",
           OPENAI_API_BASE: env.OPENAI_API_BASE || "not set",
+          effective_model,
         });
       }
 
@@ -198,15 +201,15 @@ export default {
             : 1024;
 
         const seed =
-            querySeed !== null
-              ? Number(querySeed)
-              : env.OPENAI_SEED
-              ? Number(env.OPENAI_SEED as any)
-              : undefined;
+          querySeed !== null
+            ? Number(querySeed)
+            : env.OPENAI_SEED
+            ? Number(env.OPENAI_SEED as any)
+            : undefined;
 
-        // 只有 chat/通用模型才支持 temperature/top_p；thinking 不支持
-        const supportsSampling =
-          !/thinking/i.test(model); // 简单判断：包含 "thinking" 则不支持
+        // 支持采样的模型（非 thinking）
+        const isThinking = /thinking/i.test(model);
+        const supportsSampling = !isThinking;
 
         const temperature =
           queryT !== null
@@ -228,18 +231,21 @@ export default {
           input: messages, // Responses API 支持 role/content 数组
           stream: true,
           max_output_tokens,
-          reasoning: { effort: "medium" }, // 可调 small/medium/large
         };
+
         if (seed !== undefined && !Number.isNaN(seed)) {
           payload.seed = seed;
         }
         if (supportsSampling) {
           payload.temperature = temperature;
           payload.top_p = top_p;
+        } else {
+          // reasoning 只在 thinking 模型时传
+          payload.reasoning = { effort: "medium" };
         }
 
         // 4) 请求 Responses（SSE）
-        const upstream = await fetch(`${apiBase}/responses`, {
+        let upstream = await fetch(`${apiBase}/responses`, {
           method: "POST",
           headers: {
             Authorization: `Bearer ${env.OPENAI_API_KEY}`,
@@ -250,6 +256,36 @@ export default {
           },
           body: JSON.stringify(payload),
         });
+
+        // 如果 400 且是采样/推理参数不被支持，做一次自动回退
+        if (!upstream.ok) {
+          const firstDetail = await upstream.text().catch(() => "");
+          const isUnsupportedSampling =
+            upstream.status === 400 &&
+            /Unsupported parameter.*(temperature|top_p)/i.test(firstDetail);
+          const isUnsupportedReasoning =
+            upstream.status === 400 &&
+            /Unsupported parameter.*reasoning\.effort/i.test(firstDetail);
+
+          if (isUnsupportedSampling || isUnsupportedReasoning) {
+            delete (payload as any).temperature;
+            delete (payload as any).top_p;
+            delete (payload as any).reasoning;
+
+            upstream = await fetch(`${apiBase}/responses`, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+                "Content-Type": "application/json",
+                Accept: "text/event-stream",
+                "OpenAI-Beta": env.OPENAI_BETA || "responses-2024-12-17",
+              },
+              body: JSON.stringify(payload),
+            });
+          } else {
+            return sseErrorResponse(upstream.status, firstDetail);
+          }
+        }
 
         if (!upstream.ok || !upstream.body) {
           const detail = await upstream.text().catch(() => "");
