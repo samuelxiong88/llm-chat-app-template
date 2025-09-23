@@ -89,7 +89,7 @@ export default {
     try {
       const url = new URL(request.url);
       const apiBase = env.OPENAI_API_BASE || DEFAULT_API_BASE;
-      const model = env.OPENAI_MODEL || "gpt-5-thinking"; // 默认对齐 gpt-5-thinking
+      const model = env.OPENAI_MODEL || "gpt-5-chat-latest"; // 默认对齐 gpt-5-thinking
       const SYSTEM_PROMPT = env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT;
 
       // ==== 静态资源（兜底）====
