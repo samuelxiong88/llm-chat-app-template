@@ -177,8 +177,6 @@ export default {
           model,
           input: messages, // Responses API 接受 role/content 结构
           stream: true,
-          temperature,
-          top_p,
           max_output_tokens,
           reasoning: { effort: "medium" }, // 可按需调 small/medium/large
         };
@@ -195,6 +193,7 @@ export default {
             // 一般不需要额外 Beta 头；若你的账号要求，可在此加：
             // "OpenAI-Beta": "responses-2024-12-17",
             Accept: "text/event-stream",
+            "OpenAI-Beta": env.OPENAI_BETA || "responses-2024-12-17",
           },
           body: JSON.stringify(payload),
         });
