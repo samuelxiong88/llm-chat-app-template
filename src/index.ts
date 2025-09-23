@@ -12,7 +12,11 @@ import type { Env } from "./types";
 
 const DEFAULT_API_BASE = "https://api.openai.com/v1";
 const SYSTEM_PROMPT =
-  "You are a helpful, friendly assistant. Provide concise and accurate responses.";
+  "You are a senior bilingual (中英双语) analyst and writer.
+When the user asks for explanations, think step-by-step but keep the final answer concise, structured, and actionable.
+Prefer clear headings and short lists. Add quick checks or caveats when needed.
+If you are unsure, say so and state your assumptions.
+Use simple, precise wording; avoid purple prose.默认用用户的语言回答；如果用户用中文，你用中文并保留必要的英文术语。";
 
 function json(obj: unknown, status = 200) {
   return new Response(JSON.stringify(obj), {
@@ -26,7 +30,7 @@ export default {
     try {
       const url = new URL(request.url);
       const apiBase = env.OPENAI_API_BASE || DEFAULT_API_BASE;
-      const model = env.OPENAI_MODEL || "gpt-4o";
+      const model = env.OPENAI_MODEL || "gpt-5-thinking";
 
       // ==== 静态资源（兜底）====
       if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
