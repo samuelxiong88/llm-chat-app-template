@@ -1,10 +1,11 @@
 /**
  * Worker → OpenAI Responses API (SSE)
- * - 先返回 SSE 头，随后在流内异步拉 OpenAI（浏览器不再等响应头）
- * - 工具白名单 + 自动回退：web_search_preview_2025_03_11
- * - 精准支持 response.web_search_call.* 事件（只提示一次、显示结果条数、完成提示）
- * - 8s 心跳（提示）；12s 首包回退（非流式、无工具）；45s 总超时
- * - DEBUG_DUMP=on：输出前 5 条 RAW data 行；DEBUG_EVENTS=on：未知事件可见化
+ * - 先返回 SSE 头，随后在流内异步拉 OpenAI，避免浏览器等不到响应头
+ * - 工具白名单 + 自动回退（web_search_preview_2025_03_11）
+ * - 精准支持 response.web_search_call.*（只提示一次/显示线索条数/完成提示）
+ * - 8s 心跳；12s 首包回退（非流式、无工具）；45s 总超时
+ * - DEBUG_DUMP=on：输出前 5 条 RAW data；DEBUG_EVENTS=on：未知事件可见化
+ * - SSE 转成 chat-completions 风格 choices[0].delta.content
  */
 
 const DEFAULT_API_BASE = "https://api.openai.com/v1";
@@ -218,18 +219,22 @@ export default {
               const HEARTBEAT_MS = 8000;
               const heartbeat = setInterval(() => {
                 if (Date.now() - lastTextTs > HEARTBEAT_MS) {
-                  pushHint("（仍在检索与整合，请稍候…）");
+                  controller.enqueue(sseData({
+                    id: "cmpl-chunk",
+                    object: "chat.completion.chunk",
+                    choices: [{ index: 0, delta: { content: "（仍在检索与整合，请稍候…）" }, finish_reason: null }],
+                  }));
                   lastTextTs = Date.now();
                 }
               }, HEARTBEAT_MS);
 
-              // ——关键修复：仅“正文增量”置 true；提示/心跳不置 true —— //
-              let gotFirstText = false;         // 是否已收到“正文增量”
-              let toolInProgressShown = false;  // 避免“正在检索”刷屏
+              // ——关键：只有“正文增量”才置 true；提示/心跳不置 true —— //
+              let gotFirstText = false;        // 是否已收到“正文增量”
+              let toolInProgressShown = false; // 避免“正在检索”刷屏
 
               const pushText = (text: string) => {
                 if (!text) return;
-                gotFirstText = true;            // 只有正文才标记
+                gotFirstText = true;
                 lastTextTs = Date.now();
                 controller.enqueue(sseData({
                   id: "cmpl-chunk",
@@ -239,7 +244,6 @@ export default {
               };
               const pushHint = (text: string) => {
                 if (!text) return;
-                // 不改变 gotFirstText，只是提示
                 lastTextTs = Date.now();
                 controller.enqueue(sseData({
                   id: "cmpl-chunk",
@@ -262,26 +266,31 @@ export default {
                 let buffer = "";
                 let lastEvent = "";
                 let dumpCount = 0;
+
                 while (true) {
                   const { value, done } = await reader.read();
                   if (done) break;
                   buffer += decoder.decode(value, { stream: true });
+
                   const lines = buffer.split("\n");
                   buffer = lines.pop() || "";
+
                   for (const raw of lines) {
                     const line = raw.trim();
                     if (!line) continue;
+
                     if (line.startsWith("event:")) { lastEvent = line.slice(6).trim(); continue; }
                     if (!line.startsWith("data:")) continue;
+
                     const dataStr = line.slice(5).trim();
 
-                    // RAW dump（仅调试时输出）
+                    // RAW dump（仅调试时输出前 5 条）
                     if (DEBUG_DUMP && dumpCount < 5 && dataStr !== "[DONE]") {
                       dumpCount++;
                       controller.enqueue(sseData({
                         id: "cmpl-dump",
                         object: "chat.completion.chunk",
-                        choices: [{ index: 0, delta: { content: `（RAW#${dumpCount}）${dataStr.slice(0, 300)}` }, finish_reason: null }],
+                        choices: [{ index: 0, delta: { content: `（RAW#${dumpCount}）${dataStr.slice(0,300)}` }, finish_reason: null }],
                       }));
                     }
 
@@ -290,6 +299,7 @@ export default {
                     try {
                       const obj: any = JSON.parse(dataStr);
                       const type = (obj?.type || lastEvent || obj?.event || "").toString();
+                      const tLower = type.toLowerCase();
 
                       // ① 正文增量
                       if (type.endsWith(".delta") || type === "response.delta" || typeof obj.delta === "string") {
@@ -302,37 +312,50 @@ export default {
                         continue;
                       }
 
-                      // ② web_search_call.* 事件 → 只提示一次 / 条数 / 完成
+                      // ② Responses web_search_call.* 事件（只提示一次 + 线索条数 + 完成）
                       if (type.startsWith("response.web_search_call")) {
-                        const tl = type.toLowerCase();
-                        if ((/in_progress|searching|started|created/).test(tl) && !toolInProgressShown) {
+                        if (/(in_progress|searching|started|created)$/i.test(tLower) && !toolInProgressShown) {
                           pushHint("🔎 正在联网检索…");
                           toolInProgressShown = true;
                           continue;
                         }
-                        if (tl.endsWith(".results") && Array.isArray(obj?.results)) {
+                        if (tLower.endsWith(".results") && Array.isArray(obj?.results)) {
                           pushHint(`🧭 已获取 ${obj.results.length} 条线索，正在整合…`);
                           continue;
                         }
-                        if (tl.endsWith(".completed")) {
+                        if (tLower.endsWith(".completed")) {
                           pushHint("📄 已获取结果，正在整合…");
                           continue;
                         }
                       }
 
-                      // ③ 完成
+                      // ③ 其它工具/进度类事件
+                      if (/(tool_call|tool)\.(started|created)/i.test(tLower) && !toolInProgressShown) {
+                        pushHint("🔎 正在联网检索…");
+                        toolInProgressShown = true;
+                        continue;
+                      }
+                      if (/(tool_call|tool)\.(completed|finish|finished)/i.test(tLower)) {
+                        pushHint("📄 已获取结果，正在整合…");
+                        continue;
+                      }
+                      if (/progress|working|searching|retrieving/i.test(tLower)) {
+                        pushHint("（检索进行中…）");
+                        continue;
+                      }
+
+                      // ④ 完成
                       if (type.endsWith(".done") || type === "response.completed" || obj?.done === true) {
                         pushStop(); return;
                       }
 
-                      // ④ 未知事件可见化（可选）
+                      // ⑤ 未知事件可见化（可选）
                       if (DEBUG_EVENTS && type) pushHint(`（事件：${type}）`);
                     } catch { /* 非 JSON 行忽略（或靠 RAW dump） */ }
                   }
                 }
               }
 
-              // ——发请求 + 自动回退（工具/参数 400）——
               try {
                 const headers = {
                   Authorization: `Bearer ${env.OPENAI_API_KEY}`,
@@ -340,11 +363,14 @@ export default {
                   Accept: "text/event-stream",
                   "OpenAI-Beta": (env.OPENAI_BETA || "responses-2024-12-17") + "; tools=v1",
                 };
+
+                // 第一次（可能带工具）
                 let payload = basePayload;
                 let upstream = await fetch(`${apiBase}/responses`, {
                   method: "POST", headers, body: JSON.stringify(payload), signal: upstreamCtl.signal,
                 });
 
+                // 400 → 自动回退（tools/参数不被支持）
                 if (!upstream.ok) {
                   const firstDetail = await upstream.text().catch(() => "");
                   const lower = firstDetail.toLowerCase();
@@ -367,14 +393,14 @@ export default {
                       method: "POST", headers, body: JSON.stringify(payload), signal: upstreamCtl.signal,
                     });
                   } else {
-                    pushHint(`⚠️ Upstream ${upstream.status}: ${firstDetail.slice(0, 800)}`);
+                    pushHint(`⚠️ Upstream ${upstream.status}: ${firstDetail.slice(0,800)}`);
                     pushStop(); clearInterval(heartbeat); clearTimeout(timeoutHandle); controller.close(); return;
                   }
                 }
 
                 if (!upstream.ok || !upstream.body) {
                   const detail = await upstream.text().catch(() => "");
-                  pushHint(`⚠️ Upstream error: ${detail.slice(0, 800)}`);
+                  pushHint(`⚠️ Upstream error: ${detail.slice(0,800)}`);
                   pushStop(); clearInterval(heartbeat); clearTimeout(timeoutHandle); controller.close(); return;
                 }
 
@@ -397,7 +423,7 @@ export default {
                   });
                   const txt = await r.text().catch(() => "");
                   if (!r.ok || !txt) {
-                    pushHint(`（非流式回退失败）${txt.slice(0, 600)}`);
+                    pushHint(`（非流式回退失败）${txt.slice(0,600)}`);
                     pushStop(); clearInterval(heartbeat); clearTimeout(timeoutHandle); controller.close(); return;
                   }
                   let out = "";
@@ -408,7 +434,7 @@ export default {
                       j?.output?.[0]?.content?.[0]?.text ||
                       j?.choices?.[0]?.message?.content || "";
                   } catch {}
-                  if (!out) out = txt.slice(0, 2000);
+                  if (!out) out = txt.slice(0,2000);
 
                   pushText(out);
                   pushStop(); clearInterval(heartbeat); clearTimeout(timeoutHandle); controller.close();
@@ -419,10 +445,10 @@ export default {
                 clearTimeout(firstPacketTimer);
 
                 clearInterval(heartbeat); clearTimeout(timeoutHandle);
-                if (!gotFirstText) pushStop(); // 无正文但流结束，做个收尾
+                if (!gotFirstText) pushStop();
                 controller.close();
               } catch (e) {
-                pushHint(`⚠️ Worker error: ${String(e).slice(0, 200)}`);
+                pushHint(`⚠️ Worker error: ${String(e).slice(0,200)}`);
                 pushStop(); controller.close();
               }
             })();
