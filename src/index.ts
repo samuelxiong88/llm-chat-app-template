@@ -2,7 +2,7 @@
  * Minimal passthrough: Cloudflare Worker → OpenAI Chat Completions (SSE)
  * Endpoints:
  *   GET  /api/chat?q=hello        // 调试/EventSource 兼容
- *   POST /api/chat {messages:[...]}// 标准调用
+ *   POST /api/chat {messages:[...]}// 标准调用（推荐，带完整历史）
  *   GET  /api/ping                // 连通性自检
  *   GET  /api/debug               // 变量自检
  *   GET  /                        // 简单兜底页（ASSETS 未绑定时）
@@ -11,14 +11,18 @@
 import type { Env } from "./types";
 
 const DEFAULT_API_BASE = "https://api.openai.com/v1";
-const SYSTEM_PROMPT =
-   env.SYSTEM_PROMPT ||
-"You are a senior bilingual (中英双语) analyst and writer. When the user asks for explanations, think step-by-step but keep the final answer concise, structured, and actionable. Prefer clear headings and short lists. Add quick checks or caveats when needed. If you are unsure, say so and state your assumptions. Use simple, precise wording; avoid purple prose. 默认用用户的语言回答；如果用户用中文，你用中文并保留必要的英文术语。";
+
+// 兜底系统提示（真正使用时会在 fetch 中用 env.SYSTEM_PROMPT 覆盖）
+const DEFAULT_SYSTEM_PROMPT =
+  "You are a senior bilingual (中英双语) analyst and writer. When the user asks for explanations, think step-by-step but keep the final answer concise, structured, and actionable. Prefer clear headings and short lists. Add quick checks or caveats when needed. If you are unsure, say so and state your assumptions. Use simple, precise wording; avoid purple prose. 默认用用户的语言回答；如果用户用中文，你用中文并保留必要的英文术语。";
 
 function json(obj: unknown, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" }
+    headers: {
+      "content-type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    },
   });
 }
 
@@ -28,12 +32,13 @@ export default {
       const url = new URL(request.url);
       const apiBase = env.OPENAI_API_BASE || DEFAULT_API_BASE;
       const model = env.OPENAI_MODEL || "gpt-5-thinking";
+      const SYSTEM_PROMPT = env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT;
 
       // ==== 静态资源（兜底）====
       if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
         try {
           if (env.ASSETS && typeof (env.ASSETS as any).fetch === "function") {
-            return env.ASSETS.fetch(request);
+            return (env.ASSETS as any).fetch(request);
           }
         } catch {}
         const html = `<!doctype html><meta charset="utf-8">
@@ -47,7 +52,9 @@ export default {
   <li><code>/api/debug</code></li>
 </ul>
 </body>`;
-        return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+        return new Response(html, {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
       }
 
       // ==== CORS 预检 ====
@@ -80,7 +87,10 @@ export default {
           const text = await r.text();
           return new Response(text, {
             status: r.status,
-            headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" },
+            headers: {
+              "content-type": "application/json",
+              "Access-Control-Allow-Origin": "*",
+            },
           });
         } catch (e) {
           return json({ error: String(e) }, 500);
@@ -90,12 +100,16 @@ export default {
       // ==== /api/chat ====
       if (url.pathname === "/api/chat") {
         // 1) 组装 messages（GET 用 q，POST 用 body）
-        let messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+        let messages: Array<{
+          role: "system" | "user" | "assistant";
+          content: string;
+        }>;
+
         if (request.method === "GET") {
           const q = url.searchParams.get("q") || "Hello";
           messages = [
             { role: "system", content: SYSTEM_PROMPT },
-            { role: "user", content: q }
+            { role: "user", content: q },
           ];
         } else if (request.method === "POST") {
           try {
@@ -114,51 +128,82 @@ export default {
           return json({ error: "Method not allowed" }, 405);
         }
 
-        // 2) 调 OpenAI（不传 temperature，避免 gpt-5* 报错）
+        // 2) 采样/长度参数（可由 URL 或 Env 覆盖）
         const queryT = url.searchParams.get("temperature");
- const queryTP = url.searchParams.get("top_p");
- const queryMax = url.searchParams.get("max_tokens");
- const querySeed = url.searchParams.get("seed");
+        const queryTP = url.searchParams.get("top_p");
+        const queryMax = url.searchParams.get("max_tokens");
+        const querySeed = url.searchParams.get("seed");
 
- const temperature = queryT !== null ? Number(queryT) : (env.OPENAI_TEMPERATURE ? Number(env.OPENAI_TEMPERATURE) : 0.7);
- const top_p = queryTP !== null ? Number(queryTP) : (env.OPENAI_TOP_P ? Number(env.OPENAI_TOP_P) : 1.0);
- const max_tokens = queryMax !== null ? Number(queryMax) : (env.OPENAI_MAX_TOKENS ? Number(env.OPENAI_MAX_TOKENS) : 1024);
- const seed = querySeed !== null ? Number(querySeed) : (env.OPENAI_SEED ? Number(env.OPENAI_SEED) : undefined);
+        const temperature =
+          queryT !== null
+            ? Number(queryT)
+            : env.OPENAI_TEMPERATURE
+            ? Number(env.OPENAI_TEMPERATURE as any)
+            : 0.7;
 
- const payload: any = {
-   model,
-   messages,
-   stream: true,
-   temperature,
-   top_p,
-   max_tokens,
- };
- if (seed !== undefined && !Number.isNaN(seed)) payload.seed = seed;
+        const top_p =
+          queryTP !== null
+            ? Number(queryTP)
+            : env.OPENAI_TOP_P
+            ? Number(env.OPENAI_TOP_P as any)
+            : 1.0;
+
+        const max_tokens =
+          queryMax !== null
+            ? Number(queryMax)
+            : env.OPENAI_MAX_TOKENS
+            ? Number(env.OPENAI_MAX_TOKENS as any)
+            : 1024;
+
+        const seed =
+          querySeed !== null
+            ? Number(querySeed)
+            : env.OPENAI_SEED
+            ? Number(env.OPENAI_SEED as any)
+            : undefined;
+
+        const payload: Record<string, unknown> = {
+          model,
+          messages,
+          stream: true,
+          temperature,
+          top_p,
+          max_tokens,
+        };
+        if (seed !== undefined && !Number.isNaN(seed)) {
+          (payload as any).seed = seed;
+        }
+
+        // 3) 调 OpenAI
+        const upstream = await fetch(`${apiBase}/chat/completions`, {
           method: "POST",
           headers: {
-            "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+            Authorization: `Bearer ${env.OPENAI_API_KEY}`,
             "Content-Type": "application/json",
           },
           body: JSON.stringify(payload),
         });
 
-        // 3) 失败时返回 JSON，便于定位
+        // 4) 失败时返回 JSON，便于定位
         if (!upstream.ok || !upstream.body) {
           const detail = await upstream.text().catch(() => "");
           return json(
-            { error: "OpenAI upstream error", status: upstream.status, detail },
+            {
+              error: "OpenAI upstream error",
+              status: upstream.status,
+              detail,
+            },
             upstream.status
           );
         }
 
-        // 4) 直通 OpenAI 原始 SSE（最稳）
+        // 5) 直通 OpenAI 原始 SSE
         return new Response(upstream.body, {
           headers: {
             "Content-Type": "text/event-stream; charset=utf-8",
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "Access-Control-Allow-Origin": "*",
-            // 可选：有些反代需要这一行避免缓冲
             // "X-Accel-Buffering": "no",
           },
         });
