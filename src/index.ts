@@ -1,28 +1,29 @@
 /**
  * Cloudflare Worker → OpenAI Responses API (SSE passthrough with adaptation)
  *
- * - GET  /api/chat?q=hello          单轮调试（自动补 system）
- * - POST /api/chat {messages:[...]} 标准调用（带完整历史；后端自动补 system）
- * - GET  /api/ping                   上游连通性自检
- * - GET  /api/debug                  环境变量自检
- * - GET  /                           静态资源兜底（ASSETS 未绑定时返回说明页）
+ * - GET  /api/chat?q=hello
+ * - POST /api/chat {messages:[...]}
+ * - GET  /api/ping
+ * - GET  /api/debug
  *
- * 注意：
- * - /responses 接口
- * - gpt-5-thinking 不支持 temperature/top_p；gpt-5 / gpt-5-chat-latest 支持
+ * 兼容点：
+ * - /responses 流式
+ * - 非 thinking 模型：支持 temperature/top_p
+ * - thinking 模型：不传 temperature/top_p，支持 reasoning.effort
+ * - 400 自动回退（去掉不支持的参数重试）
+ * - SSE 错误透传到前端
  */
 
-import type { Env } from "./types";
-
+// ===== 常量 =====
 const DEFAULT_API_BASE = "https://api.openai.com/v1";
 const DEFAULT_MODEL = "gpt-5-chat-latest";
-
-// 兜底系统提示（可用 env.SYSTEM_PROMPT 覆盖）
 const DEFAULT_SYSTEM_PROMPT =
   "You are a senior bilingual (中英双语) analyst and writer. When the user asks for explanations, think step-by-step but keep the final answer concise, structured, and actionable. Prefer clear headings and short lists. Add quick checks or caveats when needed. If you are unsure, say so and state your assumptions. Use simple, precise wording; avoid purple prose. 默认用用户的语言回答；如果用户用中文，你用中文并保留必要的英文术语。";
 
-// ——— 工具函数 ———
-function json(obj: unknown, status = 200) {
+const te = new TextEncoder();
+
+// ===== 小工具 =====
+function json(obj: unknown, status = 200): Response {
   return new Response(JSON.stringify(obj), {
     status,
     headers: {
@@ -31,17 +32,13 @@ function json(obj: unknown, status = 200) {
     },
   });
 }
-
-const te = new TextEncoder();
-function sseEncode(o: unknown) {
+function sseEncode(o: unknown): Uint8Array {
   return te.encode(`data: ${JSON.stringify(o)}\n\n`);
 }
-function sseDone() {
+function sseDone(): Uint8Array {
   return te.encode(`data: [DONE]\n\n`);
 }
-
-// 将上游错误透传为 SSE，方便前端直接显示错误详情
-function sseErrorResponse(status: number, detail: string) {
+function sseErrorResponse(status: number, detail: string): Response {
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       controller.enqueue(
@@ -52,7 +49,7 @@ function sseErrorResponse(status: number, detail: string) {
             {
               index: 0,
               delta: {
-                content: `⚠️ Upstream error ${status}: ${detail.slice(0, 1000)}`,
+                content: `⚠️ Upstream error ${status}: ${String(detail).slice(0, 1000)}`,
               },
               finish_reason: null,
             },
@@ -72,36 +69,31 @@ function sseErrorResponse(status: number, detail: string) {
   });
 
   return new Response(stream, {
+    status: 200,
     headers: {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache",
       "Connection": "keep-alive",
       "Access-Control-Allow-Origin": "*",
     },
-    status: 200, // SSE 正常返回，内容里描述错误
   });
 }
 
+// ===== 主处理器 =====
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: any): Promise<Response> {
     try {
       const url = new URL(request.url);
-      const apiBase = env.OPENAI_API_BASE || DEFAULT_API_BASE;
+      const apiBase = (env.OPENAI_API_BASE || DEFAULT_API_BASE).trim();
       const model = (env.OPENAI_MODEL || DEFAULT_MODEL).trim();
       const SYSTEM_PROMPT = env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT;
 
-      // ==== 静态资源（兜底）====
+      // 根/静态兜底
       if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
-        try {
-          if (env.ASSETS && typeof (env.ASSETS as any).fetch === "function") {
-            return (env.ASSETS as any).fetch(request);
-          }
-        } catch {}
         const html = `<!doctype html><meta charset="utf-8">
 <title>LLM Chat</title>
 <body style="font-family:system-ui;margin:40px">
 <h2>LLM Chat App</h2>
-<p>Assets not configured. Test endpoints:</p>
 <ul>
   <li><code>/api/ping</code></li>
   <li><code>/api/chat?q=hello</code></li>
@@ -113,7 +105,7 @@ export default {
         });
       }
 
-      // ==== CORS 预检 ====
+      // CORS 预检
       if (request.method === "OPTIONS") {
         return new Response(null, {
           headers: {
@@ -125,19 +117,17 @@ export default {
         });
       }
 
-      // ==== /api/debug ====
+      // /api/debug
       if (url.pathname === "/api/debug") {
-        // 为了排错直观，加上 effective_model
-        const effective_model = (env.OPENAI_MODEL || DEFAULT_MODEL).trim();
         return json({
           OPENAI_API_KEY: env.OPENAI_API_KEY ? "set" : "not set",
           OPENAI_MODEL: env.OPENAI_MODEL || "not set",
           OPENAI_API_BASE: env.OPENAI_API_BASE || "not set",
-          effective_model,
+          effective_model: model,
         });
       }
 
-      // ==== /api/ping ====
+      // /api/ping
       if (url.pathname === "/api/ping") {
         try {
           const r = await fetch(`${apiBase}/models`, {
@@ -156,9 +146,9 @@ export default {
         }
       }
 
-      // ==== /api/chat ====
+      // /api/chat
       if (url.pathname === "/api/chat") {
-        // 1) 组装 messages（GET 单轮；POST 带历史）
+        // 1) 组装 messages
         type Msg = { role: "system" | "user" | "assistant"; content: string };
         let messages: Msg[];
 
@@ -169,70 +159,64 @@ export default {
             { role: "user", content: q },
           ];
         } else if (request.method === "POST") {
-          try {
-            const body = await request.json();
-            const userMsgs = Array.isArray(body?.messages) ? body.messages : [];
-            messages = userMsgs.length
-              ? userMsgs
-              : [{ role: "user", content: "Hello" }];
-            if (!messages.some((m) => m.role === "system")) {
-              messages.unshift({ role: "system", content: SYSTEM_PROMPT });
-            }
-          } catch {
-            return json({ error: "Invalid JSON body" }, 400);
+          const body = await request.json().catch(() => ({}));
+          const userMsgs = Array.isArray((body as any)?.messages)
+            ? (body as any).messages
+            : [];
+          messages = userMsgs.length
+            ? userMsgs
+            : [{ role: "user", content: "Hello" }];
+          if (!messages.some((m) => m.role === "system")) {
+            messages.unshift({ role: "system", content: SYSTEM_PROMPT });
           }
         } else {
           return json({ error: "Method not allowed" }, 405);
         }
 
-        // 2) 公共参数（兼容 max_tokens / max_output_tokens 的 query 名）
-        const queryMax =
-          url.searchParams.get("max_tokens") ??
-          url.searchParams.get("max_output_tokens");
-        const querySeed = url.searchParams.get("seed");
-        const queryT = url.searchParams.get("temperature");
-        const queryTP = url.searchParams.get("top_p");
+        // 2) 参数（query/env）
+        const qMax = url.searchParams.get("max_tokens") ?? url.searchParams.get("max_output_tokens");
+        const qSeed = url.searchParams.get("seed");
+        const qT = url.searchParams.get("temperature");
+        const qTP = url.searchParams.get("top_p");
 
         const max_output_tokens =
-          queryMax !== null
-            ? Number(queryMax)
+          qMax !== null
+            ? Number(qMax)
             : env.OPENAI_MAX_TOKENS
-            ? Number(env.OPENAI_MAX_TOKENS as any)
+            ? Number(env.OPENAI_MAX_TOKENS)
             : 1024;
 
         const seed =
-          querySeed !== null
-            ? Number(querySeed)
+          qSeed !== null
+            ? Number(qSeed)
             : env.OPENAI_SEED
-            ? Number(env.OPENAI_SEED as any)
+            ? Number(env.OPENAI_SEED)
             : undefined;
 
-        // 支持采样的模型（非 thinking）
         const isThinking = /thinking/i.test(model);
         const supportsSampling = !isThinking;
 
         const temperature =
-          queryT !== null
-            ? Number(queryT)
+          qT !== null
+            ? Number(qT)
             : env.OPENAI_TEMPERATURE
-            ? Number(env.OPENAI_TEMPERATURE as any)
+            ? Number(env.OPENAI_TEMPERATURE)
             : 0.7;
 
         const top_p =
-          queryTP !== null
-            ? Number(queryTP)
+          qTP !== null
+            ? Number(qTP)
             : env.OPENAI_TOP_P
-            ? Number(env.OPENAI_TOP_P as any)
+            ? Number(env.OPENAI_TOP_P)
             : 1.0;
 
-        // 3) 组织 Responses API payload（仅传支持的字段）
+        // 3) 组织 payload（根据模型类型传递不同字段）
         const payload: Record<string, unknown> = {
           model,
-          input: messages, // Responses API 支持 role/content 数组
+          input: messages,
           stream: true,
           max_output_tokens,
         };
-
         if (seed !== undefined && !Number.isNaN(seed)) {
           payload.seed = seed;
         }
@@ -240,46 +224,41 @@ export default {
           payload.temperature = temperature;
           payload.top_p = top_p;
         } else {
-          // reasoning 只在 thinking 模型时传
+          // thinking 模型：只传 reasoning，不传采样参数
           payload.reasoning = { effort: "medium" };
         }
 
-        // 4) 请求 Responses（SSE）
+        // 4) 请求 /responses（带一次自动回退）
+        const headers = {
+          Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+          "OpenAI-Beta": env.OPENAI_BETA || "responses-2024-12-17",
+        };
+
         let upstream = await fetch(`${apiBase}/responses`, {
           method: "POST",
-          headers: {
-            Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-            "Content-Type": "application/json",
-            Accept: "text/event-stream",
-            // 很多租户需要 Beta 头；可用环境变量覆盖版本字符串
-            "OpenAI-Beta": env.OPENAI_BETA || "responses-2024-12-17",
-          },
+          headers,
           body: JSON.stringify(payload),
         });
 
-        // 如果 400 且是采样/推理参数不被支持，做一次自动回退
         if (!upstream.ok) {
           const firstDetail = await upstream.text().catch(() => "");
-          const isUnsupportedSampling =
+          const badSampling =
             upstream.status === 400 &&
             /Unsupported parameter.*(temperature|top_p)/i.test(firstDetail);
-          const isUnsupportedReasoning =
+          const badReasoning =
             upstream.status === 400 &&
             /Unsupported parameter.*reasoning\.effort/i.test(firstDetail);
 
-          if (isUnsupportedSampling || isUnsupportedReasoning) {
+          if (badSampling || badReasoning) {
             delete (payload as any).temperature;
             delete (payload as any).top_p;
             delete (payload as any).reasoning;
 
             upstream = await fetch(`${apiBase}/responses`, {
               method: "POST",
-              headers: {
-                Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-                "Content-Type": "application/json",
-                Accept: "text/event-stream",
-                "OpenAI-Beta": env.OPENAI_BETA || "responses-2024-12-17",
-              },
+              headers,
               body: JSON.stringify(payload),
             });
           } else {
@@ -289,16 +268,13 @@ export default {
 
         if (!upstream.ok || !upstream.body) {
           const detail = await upstream.text().catch(() => "");
-          // 用 SSE 透传错误，前端能直接看到原因
           return sseErrorResponse(upstream.status, detail);
         }
 
-        // 5) 将 Responses 的 SSE 适配为 chat-completions 风格（前端无需改）
+        // 5) 适配 SSE → chat-completions 风格
         const readable = upstream.body;
-
         const out = new ReadableStream<Uint8Array>({
           start(controller) {
-            // 先推送一次 role=assistant（很多前端会忽略它，不影响）
             controller.enqueue(
               sseEncode({
                 id: "cmpl-start",
@@ -312,7 +288,7 @@ export default {
             const decoder = new TextDecoder("utf-8");
             let buffer = "";
             let closed = false;
-            let lastEvent = ""; // 记录 upstream 的 event 名
+            let lastEvent = "";
 
             const pushDelta = (text: string) => {
               if (!text) return;
@@ -327,7 +303,7 @@ export default {
               );
             };
 
-            const pushStop = (reason: string = "stop") => {
+            const pushStop = (reason = "stop") => {
               controller.enqueue(
                 sseEncode({
                   id: "cmpl-stop",
@@ -340,7 +316,7 @@ export default {
 
             const reader = readable.getReader();
 
-            const pump = async () => {
+            (async () => {
               try {
                 while (true) {
                   const { value, done } = await reader.read();
@@ -358,7 +334,6 @@ export default {
                       lastEvent = line.slice(6).trim();
                       continue;
                     }
-
                     if (line.startsWith("data:")) {
                       const dataStr = line.slice(5).trim();
 
@@ -368,13 +343,10 @@ export default {
                         break;
                       }
 
-                      // 解析每条 data
                       try {
                         const obj: any = JSON.parse(dataStr);
-                        const type =
-                          obj?.type || lastEvent || obj?.event || "";
+                        const type = obj?.type || lastEvent || obj?.event || "";
 
-                        // 常见增量：*.delta，或直接有 delta/text/content
                         if (
                           type.endsWith(".delta") ||
                           type === "response.delta" ||
@@ -387,15 +359,11 @@ export default {
                               ? obj.text
                               : typeof obj.content === "string"
                               ? obj.content
-                              : typeof obj?.output_text?.content?.[0]?.text ===
-                                "string"
-                              ? obj.output_text.content[0].text
-                              : "";
+                              : (obj?.output_text?.content?.[0]?.text || "");
                           if (t) pushDelta(t);
                           continue;
                         }
 
-                        // 完成事件：*.done / response.completed / done=true
                         if (
                           type.endsWith(".done") ||
                           type === "response.completed" ||
@@ -407,12 +375,11 @@ export default {
                           break;
                         }
 
-                        // 其他可能含文本的字段，尽量兜底
                         if (typeof obj.text === "string") pushDelta(obj.text);
                         else if (typeof obj.content === "string")
                           pushDelta(obj.content);
                       } catch {
-                        // 非 JSON data（如心跳）忽略
+                        // 非 JSON data（心跳等）忽略
                       }
                     }
                   }
@@ -420,14 +387,11 @@ export default {
                   if (closed) break;
                 }
               } catch {
-                // 读取中断/网络错误，下面 finally 里统一收尾
               } finally {
                 if (!closed) pushStop("stop");
                 controller.close();
               }
-            };
-
-            pump();
+            })();
           },
         });
 
@@ -442,9 +406,8 @@ export default {
       }
 
       return json({ error: "Not found" }, 404);
-    } catch (e) {
-      // 任何 Worker 侧异常，返回 JSON，便于 Cloudflare Logs 看到栈
+    } catch (e: any) {
       return json({ error: "Worker exception", detail: String(e) }, 500);
     }
   },
-} satisfies ExportedHandler<Env>;
+};
