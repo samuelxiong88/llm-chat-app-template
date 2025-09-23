@@ -1,8 +1,9 @@
 /**
  * Worker → OpenAI Responses API with native web search + SSE
  * - 仅启用 web_search_preview（自动联网搜索）
- * - 若工具/参数不被支持，自动回退为“无工具”回答
- * - 前端无需改（SSE 以 chat-completions 风格 choices[0].delta.content 输出）
+ * - 工具/参数不被支持时自动回退为“无工具”回答
+ * - 加入“工具进度提示 + 心跳”避免长时间静默
+ * - SSE 以 chat-completions 风格 (choices[0].delta.content) 输出，前端无需改
  */
 
 const DEFAULT_API_BASE = "https://api.openai.com/v1";
@@ -24,16 +25,20 @@ function sseDone() { return te.encode(`data: [DONE]\n\n`); }
 function sseErrorResponse(status: number, detail: string) {
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      controller.enqueue(sseData({
-        id: "cmpl-error",
-        object: "chat.completion.chunk",
-        choices: [{ index: 0, delta: { content: `⚠️ Upstream error ${status}: ${String(detail).slice(0, 1000)}` }, finish_reason: null }],
-      }));
-      controller.enqueue(sseData({
-        id: "cmpl-stop",
-        object: "chat.completion.chunk",
-        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-      }));
+      controller.enqueue(
+        sseData({
+          id: "cmpl-error",
+          object: "chat.completion.chunk",
+          choices: [{ index: 0, delta: { content: `⚠️ Upstream error ${status}: ${String(detail).slice(0, 1000)}` }, finish_reason: null }],
+        })
+      );
+      controller.enqueue(
+        sseData({
+          id: "cmpl-stop",
+          object: "chat.completion.chunk",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        })
+      );
       controller.enqueue(sseDone());
       controller.close();
     },
@@ -58,6 +63,15 @@ export default {
       const model = (env.OPENAI_MODEL || DEFAULT_MODEL).trim();
       const SYSTEM_PROMPT = env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT;
       const enableNativeTools = String(env.OPENAI_NATIVE_TOOLS || "").toLowerCase() === "on";
+
+      // 工具白名单：只给这些模型附带 web_search
+      const TOOL_MODELS = new Set([
+        "gpt-4o",
+        "gpt-4o-2024-11-20",
+        "gpt-4o-mini",
+        "gpt-4.1",
+        "gpt-4.1-mini",
+      ]);
 
       // root / static
       if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
@@ -169,9 +183,9 @@ export default {
           basePayload.reasoning = { effort: "medium" }; // only for thinking models
         }
 
-        // 原生工具：仅 web_search_preview；若未开通/未启用，下面会自动回退
-        if (enableNativeTools) {
-          basePayload.tools = [{ type: "web_search_preview" }]; // 或换成 "web_search_preview_2025_03_11"
+        // 原生工具：仅 web_search_preview（模型白名单 + 环境开关）
+        if (enableNativeTools && TOOL_MODELS.has(model)) {
+          basePayload.tools = [{ type: "web_search_preview" }]; // 或 "web_search_preview_2025_03_11"
           basePayload.tool_choice = "auto";
         }
 
@@ -192,17 +206,20 @@ export default {
         // 若 400 因 tools/参数不被支持，自动回退
         if (!upstream.ok) {
           const firstDetail = await upstream.text().catch(() => "");
-          const isToolInvalidOrUnsupported =
-            upstream.status === 400 &&
-            /invalid_value.*tools|\bUnsupported (parameter|tool)\b|unknown tool|tools? not supported/i.test(firstDetail);
-          const badSampling =
-            upstream.status === 400 &&
-            /Unsupported parameter.*(temperature|top_p)/i.test(firstDetail);
-          const badReasoning =
-            upstream.status === 400 &&
-            /Unsupported parameter.*reasoning\.effort/i.test(firstDetail);
+          const lower = firstDetail.toLowerCase();
 
-          if (isToolInvalidOrUnsupported || badSampling || badReasoning) {
+          const toolsProblem = upstream.status === 400 && (
+            /invalid_value/.test(lower) && /tools/.test(lower) ||
+            /not supported with/.test(lower) && /tool/.test(lower) ||
+            /unsupported/.test(lower) && /tool/.test(lower) ||
+            /unknown tool/.test(lower) ||
+            (/param/.test(lower) && /tools/.test(lower))
+          );
+
+          const badSampling = upstream.status === 400 && /unsupported/.test(lower) && /(temperature|top_p)/i.test(lower);
+          const badReasoning = upstream.status === 400 && /unsupported/.test(lower) && /reasoning\.effort/i.test(lower);
+
+          if (toolsProblem || badSampling || badReasoning) {
             payload = {
               model,
               input: messages,
@@ -225,36 +242,60 @@ export default {
           return sseErrorResponse(upstream.status, detail);
         }
 
-        // passthrough Responses SSE → chat-completions 风格
+        // === passthrough Responses SSE → chat-completions 风格（含“工具进度提示 + 心跳”）===
         const readable = upstream.body;
+
         const out = new ReadableStream<Uint8Array>({
           start(controller) {
             // 起始：role=assistant
-            controller.enqueue(sseData({
-              id: "cmpl-start",
-              object: "chat.completion.chunk",
-              choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
-            }));
+            controller.enqueue(
+              sseData({
+                id: "cmpl-start",
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+              })
+            );
 
             const decoder = new TextDecoder("utf-8");
             let buffer = "";
             let closed = false;
             let lastEvent = "";
 
+            // 心跳：超过 N 秒无文本就提示“仍在检索…”
+            let lastTextTs = Date.now();
+            const HEARTBEAT_MS = 8000;
+            const heartbeat = setInterval(() => {
+              if (Date.now() - lastTextTs > HEARTBEAT_MS) {
+                controller.enqueue(
+                  sseData({
+                    id: "cmpl-chunk",
+                    object: "chat.completion.chunk",
+                    choices: [{ index: 0, delta: { content: "（仍在检索与整合，请稍候…）" }, finish_reason: null }],
+                  })
+                );
+                lastTextTs = Date.now();
+              }
+            }, HEARTBEAT_MS);
+
             const pushDelta = (text: string) => {
               if (!text) return;
-              controller.enqueue(sseData({
-                id: "cmpl-chunk",
-                object: "chat.completion.chunk",
-                choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-              }));
+              lastTextTs = Date.now();
+              controller.enqueue(
+                sseData({
+                  id: "cmpl-chunk",
+                  object: "chat.completion.chunk",
+                  choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+                })
+              );
             };
             const pushStop = (reason = "stop") => {
-              controller.enqueue(sseData({
-                id: "cmpl-stop",
-                object: "chat.completion.chunk",
-                choices: [{ index: 0, delta: {}, finish_reason: reason }],
-              }));
+              controller.enqueue(
+                sseData({
+                  id: "cmpl-stop",
+                  object: "chat.completion.chunk",
+                  choices: [{ index: 0, delta: {}, finish_reason: reason }],
+                })
+              );
               controller.enqueue(sseDone());
             };
 
@@ -288,10 +329,14 @@ export default {
 
                       try {
                         const obj: any = JSON.parse(dataStr);
-                        const type = obj?.type || lastEvent || obj?.event || "";
+                        const type = (obj?.type || lastEvent || obj?.event || "").toString();
 
-                        // 文本增量
-                        if (type.endsWith(".delta") || type === "response.delta" || typeof obj.delta === "string") {
+                        // ① 文本增量
+                        if (
+                          type.endsWith(".delta") ||
+                          type === "response.delta" ||
+                          typeof obj.delta === "string"
+                        ) {
                           const t =
                             typeof obj.delta === "string" ? obj.delta :
                             typeof obj.text === "string" ? obj.text :
@@ -301,15 +346,25 @@ export default {
                           continue;
                         }
 
-                        // 完成
-                        if (type.endsWith(".done") || type === "response.completed" || obj?.done === true || obj?.status === "completed") {
+                        // ② 工具事件 → 可见提示（避免“深度检索”时静默）
+                        if (/tool_call\.created$/.test(type)) { pushDelta("🔎 正在联网检索…"); continue; }
+                        if (/tool_call\.completed$/.test(type)) { pushDelta("📄 已获取结果，正在整合…"); continue; }
+
+                        // ③ 完成事件
+                        if (
+                          type.endsWith(".done") ||
+                          type === "response.completed" ||
+                          obj?.done === true ||
+                          obj?.status === "completed"
+                        ) {
                           pushStop("stop");
                           closed = true;
                           break;
                         }
 
+                        // 其他事件（心跳/状态），忽略
                       } catch {
-                        // 忽略非 JSON 行（心跳等）
+                        // 非 JSON 行（如心跳）忽略
                       }
                     }
                   }
@@ -317,6 +372,7 @@ export default {
                 }
               } catch {
               } finally {
+                clearInterval(heartbeat);
                 if (!closed) pushStop("stop");
                 controller.close();
               }
